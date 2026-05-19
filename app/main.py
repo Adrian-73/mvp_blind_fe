@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 from fastapi import FastAPI, Depends, HTTPException, status, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, HTMLResponse
 
 from app.database import init_db, close_db, get_db_connection
 from app.auth import get_current_user, get_current_admin, verify_user_token
@@ -30,11 +30,41 @@ async def lifespan(app: FastAPI):
     yield
     await close_db()
 
+tags_metadata = [
+    {
+        "name": "System Health",
+        "description": "Public, unauthenticated health checks and live heartbeat metrics.",
+    },
+    {
+        "name": "User Authentication",
+        "description": "Standard user registration and login endpoints to obtain JWT session tokens.",
+    },
+    {
+        "name": "User Operations & Chat",
+        "description": "Polled status checks, historical room chats, quiz submissions, and active client rooms.",
+    },
+    {
+        "name": "Admin Authentication",
+        "description": "Administrative credential verification and high-privilege access token generation.",
+    },
+    {
+        "name": "Admin Control Panel",
+        "description": "Matchmaking controllers, user account search lists, and active room deactivation panels.",
+    },
+    {
+        "name": "Admin Data Exports",
+        "description": "Streamed high-volume CSV downloads for user tables and historical chat transcripts.",
+    }
+]
+
 app = FastAPI(
     title="Private Blind-Dating Chat Room API",
     description="Backend API for managing private anonymous chat rooms, matchmaking, and real-time WebSockets.",
     version="1.0.0",
-    lifespan=lifespan
+    lifespan=lifespan,
+    openapi_tags=tags_metadata,
+    docs_url=None,
+    redoc_url=None
 )
 
 # CORS Configuration
@@ -47,16 +77,736 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Unauthenticated Routes ---
+# --- Dynamic Swagger Console Custom HTML Template ---
 
-@app.get("/health", status_code=status.HTTP_200_OK)
+SWAGGER_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Private Blind-Dating Chat Room API - Interactive Console</title>
+    <link rel="shortcut icon" href="https://fastapi.tiangolo.com/img/favicon.png">
+    <link rel="stylesheet" type="text/css" href="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui.css">
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Outfit:wght@500;600;700;800&family=Fira+Code:wght@400;500&display=swap');
+
+        body {
+            background-color: #0b0f19 !important;
+            background-image: radial-gradient(circle at 50% 0px, #1e1b4b 0%, #0b0f19 800px) !important;
+            margin: 0;
+            font-family: 'Inter', sans-serif;
+            color: #cbd5e1;
+        }
+
+        .premium-header {
+            max-width: 1460px;
+            margin: 0 auto;
+            padding: 30px 20px 10px 20px;
+        }
+
+        .metrics-row {
+            display: grid;
+            grid-template-columns: 1.5fr 1fr 1fr 1fr 1fr;
+            gap: 20px;
+            margin-bottom: 25px;
+        }
+
+        @media (max-width: 1024px) {
+            .metrics-row {
+                grid-template-columns: 1fr 1fr;
+            }
+            .metrics-row > :first-child {
+                grid-column: span 2;
+            }
+        }
+
+        .brand {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            background: rgba(30, 41, 59, 0.35);
+            backdrop-filter: blur(12px);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 16px;
+            padding: 20px;
+        }
+
+        .glowing-heart {
+            width: 24px;
+            height: 24px;
+            background-color: #ec4899;
+            position: relative;
+            transform: rotate(-45deg);
+            animation: heartbeat 1.2s infinite;
+            box-shadow: 0 0 15px rgba(236, 72, 153, 0.6);
+        }
+
+        .glowing-heart::before, .glowing-heart::after {
+            content: "";
+            width: 24px;
+            height: 24px;
+            background-color: #ec4899;
+            border-radius: 50%;
+            position: absolute;
+        }
+
+        .glowing-heart::before {
+            top: -12px;
+            left: 0;
+        }
+
+        .glowing-heart::after {
+            top: 0;
+            left: 12px;
+        }
+
+        @keyframes heartbeat {
+            0% { transform: rotate(-45deg) scale(1); }
+            25% { transform: rotate(-45deg) scale(1.1); }
+            35% { transform: rotate(-45deg) scale(1.05); }
+            45% { transform: rotate(-45deg) scale(1.15); }
+            100% { transform: rotate(-45deg) scale(1); }
+        }
+
+        .brand-text h2 {
+            margin: 0;
+            font-family: 'Outfit', sans-serif;
+            font-size: 20px;
+            font-weight: 700;
+            color: #f3f4f6;
+            letter-spacing: -0.5px;
+        }
+
+        .brand-text span {
+            font-size: 12px;
+            color: #a78bfa;
+            font-weight: 500;
+        }
+
+        .metric-card {
+            background: rgba(30, 41, 59, 0.35);
+            backdrop-filter: blur(12px);
+            border: 1px solid rgba(255, 255, 255, 0.06);
+            border-radius: 16px;
+            padding: 16px 20px;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            box-shadow: 0 4px 30px rgba(0, 0, 0, 0.15);
+        }
+
+        .metric-label {
+            font-size: 11px;
+            font-weight: 600;
+            color: #94a3b8;
+            text-transform: uppercase;
+            letter-spacing: 0.8px;
+            margin-bottom: 8px;
+        }
+
+        .metric-value-container {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .metric-value {
+            font-size: 22px;
+            font-family: 'Outfit', sans-serif;
+            font-weight: 700;
+            color: #f1f5f9;
+        }
+
+        .text-purple { color: #c084fc !important; text-shadow: 0 0 10px rgba(192, 132, 252, 0.3); }
+        .text-teal { color: #2dd4bf !important; text-shadow: 0 0 10px rgba(45, 212, 191, 0.3); }
+        .text-green { color: #34d399 !important; text-shadow: 0 0 10px rgba(52, 211, 153, 0.3); }
+
+        .metric-unit {
+            font-size: 12px;
+            color: #64748b;
+            margin-left: 2px;
+            font-weight: 500;
+        }
+
+        .dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+        }
+
+        .dot.green { background-color: #10b981; box-shadow: 0 0 10px #10b981; }
+        .dot.amber { background-color: #f59e0b; box-shadow: 0 0 10px #f59e0b; }
+        .dot.red { background-color: #ef4444; box-shadow: 0 0 10px #ef4444; }
+
+        .dot.heartbeat {
+            animation: glow-pulse 1.8s infinite;
+        }
+
+        @keyframes glow-pulse {
+            0% { transform: scale(1); box-shadow: 0 0 4px #10b981; }
+            50% { transform: scale(1.2); box-shadow: 0 0 12px #10b981; }
+            100% { transform: scale(1); box-shadow: 0 0 4px #10b981; }
+        }
+
+        .sandbox-row {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            margin-bottom: 10px;
+        }
+
+        @media (max-width: 768px) {
+            .sandbox-row {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .sandbox-card {
+            backdrop-filter: blur(12px);
+            border-radius: 16px;
+            padding: 20px 24px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+        }
+
+        .sandbox-card.card-purple {
+            background: linear-gradient(135deg, rgba(88, 28, 135, 0.15) 0%, rgba(30, 41, 59, 0.4) 100%);
+            border: 1px solid rgba(139, 92, 246, 0.15);
+        }
+
+        .sandbox-card.card-teal {
+            background: linear-gradient(135deg, rgba(17, 94, 89, 0.15) 0%, rgba(30, 41, 59, 0.4) 100%);
+            border: 1px solid rgba(20, 184, 166, 0.15);
+        }
+
+        .sandbox-card h3 {
+            margin: 0 0 8px 0;
+            font-family: 'Outfit', sans-serif;
+            font-size: 16px;
+            font-weight: 600;
+        }
+
+        .sandbox-card p {
+            font-size: 12px;
+            color: #94a3b8;
+            line-height: 1.5;
+            margin: 0 0 16px 0;
+        }
+
+        .sandbox-inputs {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 12px;
+            margin-bottom: 16px;
+        }
+
+        .sandbox-inputs input {
+            background: rgba(15, 23, 42, 0.6) !important;
+            border: 1px solid rgba(255, 255, 255, 0.08) !important;
+            border-radius: 8px !important;
+            padding: 10px 14px !important;
+            color: #f1f5f9 !important;
+            font-size: 12px !important;
+            font-family: 'Inter', sans-serif !important;
+            outline: none !important;
+            transition: all 0.3s ease !important;
+        }
+
+        .sandbox-inputs input:focus {
+            border-color: rgba(20, 184, 166, 0.4) !important;
+            box-shadow: 0 0 10px rgba(20, 184, 166, 0.1) !important;
+        }
+
+        .sandbox-actions {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .sandbox-btn {
+            border: none;
+            border-radius: 8px;
+            padding: 10px 18px;
+            font-size: 12px;
+            font-weight: 600;
+            cursor: pointer;
+            font-family: 'Inter', sans-serif;
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .btn-purple {
+            background: linear-gradient(135deg, #8b5cf6 0%, #6366f1 100%);
+            color: white;
+            box-shadow: 0 4px 15px rgba(139, 92, 246, 0.25);
+        }
+
+        .btn-purple:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 6px 20px rgba(139, 92, 246, 0.4);
+        }
+
+        .btn-teal {
+            background: linear-gradient(135deg, #0d9488 0%, #0f766e 100%);
+            color: white;
+            box-shadow: 0 4px 15px rgba(13, 148, 136, 0.25);
+        }
+
+        .btn-teal:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 6px 20px rgba(13, 148, 136, 0.4);
+        }
+
+        .status-msg {
+            font-size: 11px;
+            font-weight: 500;
+            transition: opacity 0.3s ease;
+        }
+
+        .status-msg.success { color: #34d399; }
+        .status-msg.error { color: #f87171; }
+
+        .btn-spinner {
+            width: 12px;
+            height: 12px;
+            border: 2px solid rgba(255, 255, 255, 0.3);
+            border-radius: 50%;
+            border-top-color: white;
+            animation: spin 0.8s linear infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        /* Swagger UI Dark Theme Override */
+        .swagger-ui {
+            background-color: transparent !important;
+            color: #cbd5e1 !important;
+        }
+        .swagger-ui .info .title {
+            color: #f3f4f6 !important;
+            font-family: 'Outfit', sans-serif !important;
+            font-weight: 700 !important;
+        }
+        .swagger-ui .info p, .swagger-ui .info li, .swagger-ui .info td {
+            color: #9ca3af !important;
+        }
+        .swagger-ui .scheme-container {
+            background: rgba(30, 41, 59, 0.4) !important;
+            backdrop-filter: blur(12px) !important;
+            border: 1px solid rgba(255, 255, 255, 0.08) !important;
+            border-radius: 16px !important;
+            box-shadow: 0 4px 30px rgba(0, 0, 0, 0.15) !important;
+            margin: 20px 0 !important;
+            padding: 20px !important;
+        }
+        .swagger-ui select, .swagger-ui input[type=text] {
+            background-color: #1f2937 !important;
+            border: 1px solid rgba(255, 255, 255, 0.1) !important;
+            color: #f3f4f6 !important;
+            border-radius: 6px !important;
+            padding: 8px 12px !important;
+        }
+        .swagger-ui .opblock {
+            background: rgba(17, 24, 39, 0.6) !important;
+            border: 1px solid rgba(255, 255, 255, 0.05) !important;
+            border-radius: 12px !important;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1) !important;
+        }
+        .swagger-ui .opblock.opblock-get {
+            border-color: rgba(16, 185, 129, 0.3) !important;
+            background: rgba(16, 185, 129, 0.05) !important;
+        }
+        .swagger-ui .opblock.opblock-post {
+            border-color: rgba(59, 130, 246, 0.3) !important;
+            background: rgba(59, 130, 246, 0.05) !important;
+        }
+        .swagger-ui .opblock.opblock-put {
+            border-color: rgba(245, 158, 11, 0.3) !important;
+            background: rgba(245, 158, 11, 0.05) !important;
+        }
+        .swagger-ui .opblock.opblock-delete {
+            border-color: rgba(239, 68, 68, 0.3) !important;
+            background: rgba(239, 68, 68, 0.05) !important;
+        }
+        .swagger-ui .opblock-summary-method {
+            border-radius: 8px !important;
+            font-weight: 700 !important;
+            font-family: 'Outfit', sans-serif !important;
+        }
+        .swagger-ui .opblock-summary-path {
+            color: #f3f4f6 !important;
+            font-family: 'Fira Code', monospace !important;
+            font-size: 14px !important;
+        }
+        .swagger-ui .opblock-summary-description {
+            color: #9ca3af !important;
+        }
+        .swagger-ui .btn.authorize {
+            background: linear-gradient(135deg, #8b5cf6 0%, #6366f1 100%) !important;
+            border: none !important;
+            color: white !important;
+            border-radius: 8px !important;
+            box-shadow: 0 4px 14px rgba(139, 92, 246, 0.4) !important;
+            font-weight: 600 !important;
+            transition: all 0.3s ease !important;
+            padding: 8px 20px !important;
+        }
+        .swagger-ui .btn.authorize:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 6px 20px rgba(139, 92, 246, 0.6) !important;
+        }
+        .swagger-ui .btn.authorize svg {
+            fill: white !important;
+        }
+        .swagger-ui .authorization__btn svg {
+            fill: #a78bfa !important;
+        }
+        .swagger-ui .opblock .opblock-summary-method-get { background: #10b981 !important; color: white !important; }
+        .swagger-ui .opblock .opblock-summary-method-post { background: #3b82f6 !important; color: white !important; }
+        .swagger-ui .opblock .opblock-summary-method-put { background: #f59e0b !important; color: white !important; }
+        .swagger-ui .opblock .opblock-summary-method-delete { background: #ef4444 !important; color: white !important; }
+        .swagger-ui .dialog-ux .modal-ux {
+            background-color: #111827 !important;
+            border: 1px solid rgba(255, 255, 255, 0.1) !important;
+            border-radius: 16px !important;
+            box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.5) !important;
+        }
+        .swagger-ui .dialog-ux .modal-ux-header h3 {
+            color: #f3f4f6 !important;
+            font-family: 'Outfit', sans-serif !important;
+        }
+        .swagger-ui .dialog-ux .modal-ux-content {
+            color: #cbd5e1 !important;
+        }
+        .swagger-ui .dialog-ux .modal-ux-header .close-button {
+            fill: #9ca3af !important;
+        }
+        .swagger-ui .model-box {
+            background-color: #111827 !important;
+            border: 1px solid rgba(255, 255, 255, 0.05) !important;
+            border-radius: 8px !important;
+            padding: 10px !important;
+        }
+        .swagger-ui .model {
+            color: #cbd5e1 !important;
+        }
+        .swagger-ui .prop-type {
+            color: #f472b6 !important;
+        }
+        .swagger-ui .prop-format {
+            color: #9ca3af !important;
+        }
+        .swagger-ui table thead tr td, .swagger-ui table thead tr th {
+            color: #cbd5e1 !important;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1) !important;
+        }
+        .swagger-ui .parameter__name.required {
+            color: #ef4444 !important;
+        }
+        .swagger-ui .parameter__name {
+            color: #f3f4f6 !important;
+        }
+        .swagger-ui .response-col_status {
+            color: #f3f4f6 !important;
+        }
+        .swagger-ui .topbar {
+            display: none !important;
+        }
+        .swagger-ui .info {
+            margin: 15px 0 20px 0 !important;
+        }
+    </style>
+</head>
+<body>
+    <div class="premium-header">
+        <div class="metrics-row">
+            <div class="brand">
+                <div class="glowing-heart"></div>
+                <div class="brand-text">
+                    <h2>Private Blind-Dating API</h2>
+                    <span>Interactive Developer Workspace</span>
+                </div>
+            </div>
+            
+            <div class="metric-card">
+                <span class="metric-label">Database Status</span>
+                <div class="metric-value-container">
+                    <div id="db-status-dot" class="dot amber"></div>
+                    <span id="db-status-text" class="metric-value">Checking...</span>
+                </div>
+            </div>
+            
+            <div class="metric-card">
+                <span class="metric-label">Active Matches</span>
+                <div class="metric-value-container">
+                    <span id="active-rooms-count" class="metric-value text-purple">--</span>
+                    <span class="metric-unit">rooms</span>
+                </div>
+            </div>
+            
+            <div class="metric-card">
+                <span class="metric-label">WebSocket Listeners</span>
+                <div class="metric-value-container">
+                    <span id="connected-users-count" class="metric-value text-teal">--</span>
+                    <span class="metric-unit">connected</span>
+                </div>
+            </div>
+            
+            <div class="metric-card">
+                <span class="metric-label">Uptime Check</span>
+                <div class="metric-value-container">
+                    <div class="dot green heartbeat"></div>
+                    <span class="metric-value text-green">Online</span>
+                </div>
+            </div>
+        </div>
+
+        <div class="sandbox-row">
+            <div class="sandbox-card card-purple">
+                <div>
+                    <h3>🎭 Quick User Sandbox</h3>
+                    <p>Instantly generate and register a new random user profile, fetch their JWT, and auto-authorize Swagger UI for user endpoints.</p>
+                </div>
+                <div class="sandbox-actions">
+                    <button id="btn-user-auth" class="sandbox-btn btn-purple">
+                        <span class="btn-spinner" id="spinner-user" style="display: none;"></span>
+                        Auto-Register & Auth User
+                    </button>
+                    <span id="user-status" class="status-msg"></span>
+                </div>
+            </div>
+            
+            <div class="sandbox-card card-teal">
+                <div>
+                    <h3>🔑 Quick Admin Sandbox</h3>
+                    <p>Log in using admin credentials to generate an admin token, and auto-authorize Swagger UI for admin endpoints.</p>
+                </div>
+                <div>
+                    <div class="sandbox-inputs">
+                        <input type="text" id="admin-user-input" placeholder="Admin Username" value="test_admin" />
+                        <input type="password" id="admin-pass-input" placeholder="Admin Password" value="test_password" />
+                    </div>
+                    <div class="sandbox-actions">
+                        <button id="btn-admin-auth" class="sandbox-btn btn-teal">
+                            <span class="btn-spinner" id="spinner-admin" style="display: none;"></span>
+                            Authenticate Admin
+                        </button>
+                        <span id="admin-status" class="status-msg"></span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div id="swagger-ui"></div>
+
+    <script src="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-standalone-preset.js"></script>
+    <script>
+        // Initialize Swagger UI and assign to window for sandbox usage
+        window.onload = function() {
+            window.ui = SwaggerUIBundle({
+                url: "/openapi.json",
+                dom_id: "#swagger-ui",
+                deepLinking: true,
+                presets: [
+                    SwaggerUIBundle.presets.apis,
+                    SwaggerUIBundle.SwaggerUIStandalonePreset
+                ],
+                plugins: [
+                    SwaggerUIBundle.plugins.DownloadUrl
+                ],
+                layout: "BaseLayout"
+            });
+            
+            // Trigger initial metrics fetch once Swagger loads
+            updateMetrics();
+        };
+
+        // Function to update metrics
+        async function updateMetrics() {
+            try {
+                const response = await fetch('/api/public/metrics');
+                if (response.ok) {
+                    const data = await response.json();
+                    
+                    const dbDot = document.getElementById('db-status-dot');
+                    const dbText = document.getElementById('db-status-text');
+                    if (data.db_connected) {
+                        dbDot.className = 'dot green';
+                        dbText.innerText = 'Connected';
+                        dbText.className = 'metric-value text-green';
+                    } else {
+                        dbDot.className = 'dot red';
+                        dbText.innerText = 'Offline';
+                        dbText.className = 'metric-value text-red';
+                    }
+                    
+                    document.getElementById('active-rooms-count').innerText = data.active_rooms_count;
+                    document.getElementById('connected-users-count').innerText = data.connected_users_count;
+                }
+            } catch (e) {
+                console.error("Failed fetching metrics:", e);
+            }
+        }
+
+        // Fetch metrics every 5 seconds
+        setInterval(updateMetrics, 5000);
+
+        // Auto-Register & Auth Mock User
+        document.getElementById('btn-user-auth').addEventListener('click', async () => {
+            const btn = document.getElementById('btn-user-auth');
+            const spinner = document.getElementById('spinner-user');
+            const statusMsg = document.getElementById('user-status');
+            
+            btn.disabled = true;
+            spinner.style.display = 'inline-block';
+            statusMsg.innerText = '';
+            
+            try {
+                const randId = Math.floor(Math.random() * 90000) + 10000;
+                const testEmail = `dev_user_${randId}@example.com`;
+                const testPassword = `pass_${randId}_secure`;
+                
+                const signupRes = await fetch('/api/signup', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        email: testEmail,
+                        password: testPassword,
+                        quiz_answers: {
+                            q1: "spontaneous",
+                            q2: "introvert",
+                            q3: "gaming",
+                            q4: "night",
+                            q5: "dogs"
+                        }
+                    })
+                });
+                
+                if (!signupRes.ok) {
+                    throw new Error(`Signup failed: ${signupRes.statusText}`);
+                }
+                
+                const signupData = await signupRes.json();
+                const token = signupData.token;
+                
+                // programmatically authorize user
+                if (window.ui) {
+                    window.ui.preauthorizeApiKey("UserSecurity", token);
+                    statusMsg.className = "status-msg success";
+                    statusMsg.innerText = `Authorized: ${testEmail}`;
+                } else {
+                    statusMsg.className = "status-msg error";
+                    statusMsg.innerText = "Swagger UI not ready";
+                }
+                
+            } catch (err) {
+                statusMsg.className = "status-msg error";
+                statusMsg.innerText = err.message || "Failed auto-auth";
+            } finally {
+                btn.disabled = false;
+                spinner.style.display = 'none';
+                updateMetrics();
+            }
+        });
+
+        // Authenticate Admin
+        document.getElementById('btn-admin-auth').addEventListener('click', async () => {
+            const btn = document.getElementById('btn-admin-auth');
+            const spinner = document.getElementById('spinner-admin');
+            const statusMsg = document.getElementById('admin-status');
+            const username = document.getElementById('admin-user-input').value;
+            const password = document.getElementById('admin-pass-input').value;
+            
+            btn.disabled = true;
+            spinner.style.display = 'inline-block';
+            statusMsg.innerText = '';
+            
+            try {
+                const loginRes = await fetch('/api/admin/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username, password })
+                });
+                
+                if (!loginRes.ok) {
+                    throw new Error("Invalid admin credentials");
+                }
+                
+                const loginData = await loginRes.json();
+                const token = loginData.token;
+                
+                // programmatically authorize admin
+                if (window.ui) {
+                    window.ui.preauthorizeApiKey("AdminSecurity", token);
+                    statusMsg.className = "status-msg success";
+                    statusMsg.innerText = "Admin Authorized!";
+                } else {
+                    statusMsg.className = "status-msg error";
+                    statusMsg.innerText = "Swagger UI not ready";
+                }
+                
+            } catch (err) {
+                statusMsg.className = "status-msg error";
+                statusMsg.innerText = err.message || "Login failed";
+            } finally {
+                btn.disabled = false;
+                spinner.style.display = 'none';
+                updateMetrics();
+            }
+        });
+    </script>
+</body>
+</html>
+"""
+
+# --- System Metrics & Custom Swagger Console Routes ---
+
+@app.get("/api/public/metrics", status_code=status.HTTP_200_OK, include_in_schema=False)
+async def public_metrics(conn: asyncpg.Connection = Depends(get_db_connection)):
+    """Exposes real-time system health and websocket usage counters (public/developer-facing)."""
+    db_connected = False
+    try:
+        await conn.execute("SELECT 1")
+        db_connected = True
+    except Exception as e:
+        print(f"Metrics DB connection check failed: {e}", file=sys.stderr)
+
+    active_rooms = 0
+    if db_connected:
+        try:
+            active_rooms = await conn.fetchval("SELECT COUNT(*) FROM rooms WHERE is_active = true") or 0
+        except Exception as e:
+            print(f"Metrics rooms query failed: {e}", file=sys.stderr)
+
+    connected_users = sum(len(users) for users in connections.values())
+
+    return {
+        "db_connected": db_connected,
+        "active_rooms_count": active_rooms,
+        "connected_users_count": connected_users
+    }
+
+@app.get("/docs", include_in_schema=False)
+async def custom_swagger_docs():
+    """Renders the custom premium developer console with interactive JWT generator."""
+    return HTMLResponse(content=SWAGGER_TEMPLATE, status_code=status.HTTP_200_OK)
+
+@app.get("/health", status_code=status.HTTP_200_OK, tags=["System Health"])
 async def health_check():
     """Unauthenticated health endpoint used by Render and cron-job.org."""
     return {"status": "ok"}
 
 # --- User Auth Endpoints ---
 
-@app.post("/api/signup", response_model=AuthResponse, status_code=status.HTTP_200_OK)
+@app.post("/api/signup", response_model=AuthResponse, status_code=status.HTTP_200_OK, tags=["User Authentication"])
 async def signup(
     body: SignupRequest,
     conn: asyncpg.Connection = Depends(get_db_connection)
@@ -64,7 +814,7 @@ async def signup(
     """Signs up a new user and returns their profile with custom JWT."""
     return await register_user(body.email, body.password, body.quiz_answers, conn)
 
-@app.post("/api/auth/login", response_model=AuthResponse, status_code=status.HTTP_200_OK)
+@app.post("/api/auth/login", response_model=AuthResponse, status_code=status.HTTP_200_OK, tags=["User Authentication"])
 async def login(
     body: LoginRequest,
     conn: asyncpg.Connection = Depends(get_db_connection)
@@ -74,7 +824,7 @@ async def login(
 
 # --- User Routes ---
 
-@app.get("/api/me/status", response_model=StatusResponse, status_code=status.HTTP_200_OK)
+@app.get("/api/me/status", response_model=StatusResponse, status_code=status.HTTP_200_OK, tags=["User Operations & Chat"])
 async def get_my_status(
     current_user: dict = Depends(get_current_user),
     conn: asyncpg.Connection = Depends(get_db_connection)
@@ -82,7 +832,7 @@ async def get_my_status(
     """Polled by the client waiting room to verify current matchmaking status."""
     return await get_user_status(current_user["id"], conn)
 
-@app.post("/api/user/quiz", status_code=status.HTTP_200_OK)
+@app.post("/api/user/quiz", status_code=status.HTTP_200_OK, tags=["User Operations & Chat"])
 async def submit_user_quiz(
     body: dict[str, str],
     current_user: dict = Depends(get_current_user),
@@ -91,7 +841,7 @@ async def submit_user_quiz(
     """Allows authenticated users to submit or update their quiz answers."""
     return await submit_quiz(current_user["id"], body, conn)
 
-@app.get("/api/rooms/{room_id}/messages", response_model=MessagesListResponse, status_code=status.HTTP_200_OK)
+@app.get("/api/rooms/{room_id}/messages", response_model=MessagesListResponse, status_code=status.HTTP_200_OK, tags=["User Operations & Chat"])
 async def get_messages(
     room_id: UUID,
     before: UUID | None = Query(None, description="Load messages before this message UUID for pagination"),
@@ -104,7 +854,7 @@ async def get_messages(
 
 # --- Admin Auth Endpoints ---
 
-@app.post("/api/admin/login", response_model=AdminTokenResponse, status_code=status.HTTP_200_OK)
+@app.post("/api/admin/login", response_model=AdminTokenResponse, status_code=status.HTTP_200_OK, tags=["Admin Authentication"])
 async def admin_login(body: AdminLoginRequest):
     """Authenticates the admin using environment variables and generates an Admin JWT."""
     admin_user = os.getenv("ADMIN_USERNAME")
@@ -130,7 +880,7 @@ async def admin_login(body: AdminLoginRequest):
 
 # --- Admin Operations Endpoints ---
 
-@app.get("/api/admin/users", response_model=AdminUsersListResponse, status_code=status.HTTP_200_OK)
+@app.get("/api/admin/users", response_model=AdminUsersListResponse, status_code=status.HTTP_200_OK, tags=["Admin Control Panel"])
 async def get_all_users(
     search: str | None = Query(None, description="Search by email or display name"),
     page: int = Query(1, ge=1, description="Page index"),
@@ -141,7 +891,7 @@ async def get_all_users(
     """Lists all users registered in the system (admin only)."""
     return await get_admin_users(search, page, limit, conn)
 
-@app.post("/api/admin/match", response_model=MatchResponse, status_code=status.HTTP_200_OK)
+@app.post("/api/admin/match", response_model=MatchResponse, status_code=status.HTTP_200_OK, tags=["Admin Control Panel"])
 async def match_waiting_users(
     body: MatchRequest,
     current_admin: str = Depends(get_current_admin),
@@ -150,7 +900,7 @@ async def match_waiting_users(
     """Matches two waiting users into an active chat room (admin only)."""
     return await match_users(body.user_a_id, body.user_b_id, conn)
 
-@app.get("/api/admin/rooms", response_model=AdminRoomsListResponse, status_code=status.HTTP_200_OK)
+@app.get("/api/admin/rooms", response_model=AdminRoomsListResponse, status_code=status.HTTP_200_OK, tags=["Admin Control Panel"])
 async def get_active_rooms(
     current_admin: str = Depends(get_current_admin),
     conn: asyncpg.Connection = Depends(get_db_connection)
@@ -158,7 +908,7 @@ async def get_active_rooms(
     """Lists all active chat rooms (admin only)."""
     return await get_admin_rooms(conn)
 
-@app.post("/api/admin/rooms/{room_id}/deactivate", status_code=status.HTTP_200_OK)
+@app.post("/api/admin/rooms/{room_id}/deactivate", status_code=status.HTTP_200_OK, tags=["Admin Control Panel"])
 async def deactivate_chat_room(
     room_id: UUID,
     current_admin: str = Depends(get_current_admin),
@@ -224,7 +974,7 @@ async def export_users_csv_stream():
                 output.seek(0)
                 output.truncate(0)
 
-@app.get("/api/admin/users/export")
+@app.get("/api/admin/users/export", tags=["Admin Data Exports"])
 async def export_users_csv(current_admin: str = Depends(get_current_admin)):
     """Downloads database users record in CSV format using StreamingResponse (admin only)."""
     return StreamingResponse(
@@ -287,7 +1037,7 @@ async def export_messages_csv_stream(room_id: UUID | None):
                 output.seek(0)
                 output.truncate(0)
 
-@app.get("/api/admin/messages/export")
+@app.get("/api/admin/messages/export", tags=["Admin Data Exports"])
 async def export_messages_csv(
     room_id: UUID | None = Query(None, description="Filter export by room UUID"),
     current_admin: str = Depends(get_current_admin)

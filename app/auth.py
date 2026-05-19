@@ -12,8 +12,8 @@ import asyncpg
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 # OAuth2 schemes
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
-admin_oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/admin/login")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login", scheme_name="UserSecurity")
+admin_oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/admin/login", scheme_name="AdminSecurity")
 
 def hash_password(password: str) -> str:
     """Hashes a plain password using bcrypt."""
