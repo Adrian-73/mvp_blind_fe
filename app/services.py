@@ -4,7 +4,7 @@ import random
 from datetime import datetime, timezone
 from uuid import UUID
 from fastapi import HTTPException, status
-import asyncpg
+from supabase import Client
 from app.utils.names import generate_display_name
 from app.utils.avatars import generate_avatar_seed
 from app.auth import hash_password, verify_password, create_user_token
@@ -14,19 +14,16 @@ async def register_user(
     email: str,
     password_plain: str,
     quiz_answers: dict[str, str],
-    conn: asyncpg.Connection
+    db: Client
 ) -> dict:
-    """Signs up a new user, hashes their password, generates names/avatars,
-
-    creates their records in a single database transaction, and issues a JWT.
+    """Signs up a new user, hashes their password, generates display names/avatars,
+    
+    creates records inside Supabase over HTTP, and issues a JWT token.
     """
     # 1. Check if email already registered
     try:
-        existing_user = await conn.fetchval(
-            "SELECT id FROM users WHERE email = $1",
-            email
-        )
-        if existing_user:
+        res = db.table("users").select("id").eq("email", email).execute()
+        if res.data:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="Email already registered"
@@ -44,11 +41,8 @@ async def register_user(
     display_name = generate_display_name()
     for _ in range(5):
         try:
-            collides = await conn.fetchval(
-                "SELECT id FROM users WHERE display_name = $1",
-                display_name
-            )
-            if not collides:
+            res = db.table("users").select("id").eq("display_name", display_name).execute()
+            if not res.data:
                 break
         except Exception as e:
             print(f"Error checking display name collision for {display_name}: {e}", file=sys.stderr)
@@ -60,33 +54,32 @@ async def register_user(
     # 3. Avatar seed generation
     avatar_seed = generate_avatar_seed()
 
-    # 4. Insert into database using a transaction
+    # 4. Insert into database with simulated programmatic rollback
     hashed_pwd = hash_password(password_plain)
+    user_id = None
     
     try:
-        async with conn.transaction():
-            user_row = await conn.fetchrow(
-                """
-                INSERT INTO users (email, display_name, avatar_seed, quiz_answers, status)
-                VALUES ($1, $2, $3, $4, 'waiting')
-                RETURNING id, display_name, avatar_seed, status
-                """,
-                email, display_name, avatar_seed, json.dumps(quiz_answers)
-            )
+        # Insert user profile row
+        res = db.table("users").insert({
+            "email": email,
+            "display_name": display_name,
+            "avatar_seed": avatar_seed,
+            "quiz_answers": quiz_answers,
+            "status": "waiting"
+        }).execute()
+        
+        if not res.data:
+            raise Exception("Failed to insert user profile row")
             
-            if not user_row:
-                raise Exception("Failed to insert user row")
-                
-            user_id = user_row["id"]
-            
-            await conn.execute(
-                """
-                INSERT INTO user_credentials (user_id, password_hash)
-                VALUES ($1, $2)
-                """,
-                user_id, hashed_pwd
-            )
-            
+        user_row = res.data[0]
+        user_id = user_row["id"]
+        
+        # Insert user password credentials
+        db.table("user_credentials").insert({
+            "user_id": user_id,
+            "password_hash": hashed_pwd
+        }).execute()
+        
         token = create_user_token(str(user_id))
         
         return {
@@ -99,7 +92,13 @@ async def register_user(
             }
         }
     except Exception as e:
-        print(f"Transaction failed during signup for {email}: {e}", file=sys.stderr)
+        print(f"Signup failed for {email}: {e}", file=sys.stderr)
+        # Programmatic Rollback: If user profile was inserted but credentials failed, clean up the profile
+        if user_id:
+            try:
+                db.table("users").delete().eq("id", user_id).execute()
+            except Exception as rollback_err:
+                print(f"Cleanup rollback failed for user profile {user_id}: {rollback_err}", file=sys.stderr)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Could not complete registration due to database transaction failure"
@@ -108,26 +107,31 @@ async def register_user(
 async def authenticate_user(
     email: str,
     password_plain: str,
-    conn: asyncpg.Connection
+    db: Client
 ) -> dict:
     """Verifies user login credentials, fetches user profile, and issues a JWT."""
     try:
-        row = await conn.fetchrow(
-            """
-            SELECT u.id, u.display_name, u.avatar_seed, u.status, c.password_hash
-            FROM users u
-            JOIN user_credentials c ON u.id = c.user_id
-            WHERE u.email = $1
-            """,
-            email
-        )
-        if not row:
+        # Fetch profile and password hash using PostgREST relation selection
+        res = db.table("users").select(
+            "id, display_name, avatar_seed, status, user_credentials(password_hash)"
+        ).eq("email", email).execute()
+        
+        if not res.data:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid email or password"
             )
         
-        if not verify_password(password_plain, row["password_hash"]):
+        row = res.data[0]
+        cred_data = row.get("user_credentials")
+        
+        password_hash = None
+        if isinstance(cred_data, dict):
+            password_hash = cred_data.get("password_hash")
+        elif isinstance(cred_data, list) and cred_data:
+            password_hash = cred_data[0].get("password_hash")
+            
+        if not password_hash or not verify_password(password_plain, password_hash):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid email or password"
@@ -155,44 +159,37 @@ async def authenticate_user(
 
 async def get_user_status(
     user_id: UUID,
-    conn: asyncpg.Connection
+    db: Client
 ) -> dict:
     """Retrieves current matchmaking status and active room partner information."""
     try:
-        user_row = await conn.fetchrow(
-            "SELECT status, room_id FROM users WHERE id = $1",
-            user_id
-        )
-        if not user_row:
+        res = db.table("users").select("status, room_id").eq("id", str(user_id)).execute()
+        if not res.data:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="User not found"
             )
             
+        user_row = res.data[0]
         status_val = user_row["status"]
         room_id = user_row["room_id"]
         
         if status_val == "matched" and room_id:
-            # Load active room details and other participant
-            room_row = await conn.fetchrow(
-                "SELECT user_a, user_b, is_active FROM rooms WHERE id = $1",
-                room_id
-            )
-            if room_row and room_row["is_active"]:
-                partner_id = room_row["user_b"] if room_row["user_a"] == user_id else room_row["user_a"]
-                partner_row = await conn.fetchrow(
-                    "SELECT display_name, avatar_seed FROM users WHERE id = $1",
-                    partner_id
-                )
-                if partner_row:
-                    return {
-                        "status": "matched",
-                        "room_id": room_id,
-                        "partner_display_name": partner_row["display_name"],
-                        "partner_avatar_seed": partner_row["avatar_seed"]
-                    }
+            res_room = db.table("rooms").select("user_a, user_b, is_active").eq("id", room_id).execute()
+            if res_room.data:
+                room_row = res_room.data[0]
+                if room_row["is_active"]:
+                    partner_id = room_row["user_b"] if room_row["user_a"] == str(user_id) else room_row["user_a"]
+                    res_partner = db.table("users").select("display_name, avatar_seed").eq("id", partner_id).execute()
+                    if res_partner.data:
+                        partner_row = res_partner.data[0]
+                        return {
+                            "status": "matched",
+                            "room_id": room_id,
+                            "partner_display_name": partner_row["display_name"],
+                            "partner_avatar_seed": partner_row["avatar_seed"]
+                        }
         
-        # Fallback or standard waiting response
         return {
             "status": "waiting",
             "room_id": None,
@@ -211,19 +208,12 @@ async def get_user_status(
 async def submit_quiz(
     user_id: UUID,
     quiz_answers: dict[str, str],
-    conn: asyncpg.Connection
+    db: Client
 ) -> dict:
     """Updates user quiz answers in the database."""
     try:
-        res = await conn.execute(
-            """
-            UPDATE users
-            SET quiz_answers = $1
-            WHERE id = $2
-            """,
-            json.dumps(quiz_answers), user_id
-        )
-        if res == "UPDATE 0":
+        res = db.table("users").update({"quiz_answers": quiz_answers}).eq("id", str(user_id)).execute()
+        if not res.data:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="User profile not found"
@@ -242,22 +232,25 @@ async def get_room_messages(
     room_id: UUID,
     user_id: UUID,
     before_id: UUID | None,
-    conn: asyncpg.Connection
+    db: Client
 ) -> list[dict]:
     """Loads historical messages in a room, optionally before a specific message ID."""
     # 1. Authorize user has access to room
     try:
-        room_row = await conn.fetchrow(
-            "SELECT user_a, user_b, is_active FROM rooms WHERE id = $1",
-            room_id
-        )
-        if not room_row or not room_row["is_active"]:
+        res_room = db.table("rooms").select("user_a, user_b, is_active").eq("id", str(room_id)).execute()
+        if not res_room.data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Active room not found"
+            )
+        room_row = res_room.data[0]
+        if not room_row["is_active"]:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Active room not found"
             )
             
-        if room_row["user_a"] != user_id and room_row["user_b"] != user_id:
+        if room_row["user_a"] != str(user_id) and room_row["user_b"] != str(user_id):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="You do not have access to this room"
@@ -274,38 +267,24 @@ async def get_room_messages(
     # 2. Fetch history
     try:
         if before_id:
-            # Find the sent_at of the 'before' message first
-            before_sent_at = await conn.fetchval(
-                "SELECT sent_at FROM messages WHERE id = $1 AND room_id = $2",
-                before_id, room_id
-            )
-            if not before_sent_at:
+            res_before = db.table("messages").select("sent_at").eq("id", str(before_id)).eq("room_id", str(room_id)).execute()
+            if not res_before.data:
                 return []
-                
-            rows = await conn.fetch(
-                """
-                SELECT id, sender_id, content, sent_at
-                FROM messages
-                WHERE room_id = $1 AND sent_at < $2
-                ORDER BY sent_at DESC
-                LIMIT 50
-                """,
-                room_id, before_sent_at
-            )
-        else:
-            rows = await conn.fetch(
-                """
-                SELECT id, sender_id, content, sent_at
-                FROM messages
-                WHERE room_id = $1
-                ORDER BY sent_at DESC
-                LIMIT 50
-                """,
-                room_id
-            )
+            before_sent_at = res_before.data[0]["sent_at"]
             
-        # Reverse the list to get chronological (ASC) order
-        messages = [dict(row) for row in reversed(rows)]
+            res_msg = db.table("messages").select("id, sender_id, content, sent_at")\
+                .eq("room_id", str(room_id))\
+                .lt("sent_at", before_sent_at)\
+                .order("sent_at", desc=True)\
+                .limit(50).execute()
+        else:
+            res_msg = db.table("messages").select("id, sender_id, content, sent_at")\
+                .eq("room_id", str(room_id))\
+                .order("sent_at", desc=True)\
+                .limit(50).execute()
+            
+        # Reverse chronological list to ascending order
+        messages = [dict(row) for row in reversed(res_msg.data)]
         return messages
     except Exception as e:
         print(f"Error fetching room messages for room_id={room_id}, before_id={before_id}: {e}", file=sys.stderr)
@@ -318,42 +297,32 @@ async def get_admin_users(
     search: str | None,
     page: int,
     limit: int,
-    conn: asyncpg.Connection
+    db: Client
 ) -> dict:
-    """Returns a list of users filtered by search keyword and paginated."""
+    """Returns a list of users filtered by search keyword and paginated (admin only)."""
     offset = (page - 1) * limit
     
     try:
-        where_clause = ""
-        params = []
-        if search:
-            where_clause = "WHERE email ILIKE $1 OR display_name ILIKE $1"
-            params.append(f"%{search}%")
-            
-        count_query = f"SELECT COUNT(id) FROM users {where_clause}"
-        total = await conn.fetchval(count_query, *params)
+        query = db.table("users").select("id, email, display_name, avatar_seed, status, room_id, quiz_answers, created_at", count="exact")
         
-        users_query = f"""
-            SELECT id, email, display_name, avatar_seed, status, room_id, quiz_answers, created_at
-            FROM users
-            {where_clause}
-            ORDER BY created_at DESC
-            LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}
-        """
-        user_params = list(params) + [limit, offset]
-        rows = await conn.fetch(users_query, *user_params)
+        if search:
+            query = query.or_(f"email.ilike.%{search}%,display_name.ilike.%{search}%")
+            
+        res = query.order("created_at", desc=True).range(offset, offset + limit - 1).execute()
         
         users = []
-        for row in rows:
+        for row in res.data:
             u = dict(row)
-            # Parse JSON safely
             if isinstance(u["quiz_answers"], str):
-                u["quiz_answers"] = json.loads(u["quiz_answers"])
+                try:
+                    u["quiz_answers"] = json.loads(u["quiz_answers"])
+                except Exception:
+                    pass
             users.append(u)
             
         return {
             "users": users,
-            "total": total,
+            "total": res.count if res.count is not None else len(users),
             "page": page
         }
     except Exception as e:
@@ -366,9 +335,9 @@ async def get_admin_users(
 async def match_users(
     user_a_id: UUID,
     user_b_id: UUID,
-    conn: asyncpg.Connection
+    db: Client
 ) -> dict:
-    """Matches two waiting users into an active room."""
+    """Matches two waiting users into an active room with simulated transactional safety (admin only)."""
     if user_a_id == user_b_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -376,95 +345,74 @@ async def match_users(
         )
 
     try:
-        # Check both users exist and status is waiting
-        rows = await conn.fetch(
-            """
-            SELECT id, status, display_name, avatar_seed
-            FROM users
-            WHERE id = $1 OR id = $2
-            """,
-            user_a_id, user_b_id
-        )
+        res_users = db.table("users").select("id, status, display_name, avatar_seed").in_("id", [str(user_a_id), str(user_b_id)]).execute()
         
-        if len(rows) != 2:
+        if len(res_users.data) != 2:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="One or both users do not exist"
             )
             
-        user_map = {row["id"]: dict(row) for row in rows}
+        user_map = {row["id"]: dict(row) for row in res_users.data}
         
-        if user_map[user_a_id]["status"] != "waiting" or user_map[user_b_id]["status"] != "waiting":
+        if user_map[str(user_a_id)]["status"] != "waiting" or user_map[str(user_b_id)]["status"] != "waiting":
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="One or both users are already matched"
             )
             
-        async with conn.transaction():
-            # Create the room
-            room_id = await conn.fetchval(
-                """
-                INSERT INTO rooms (user_a, user_b, created_by_admin, is_active)
-                VALUES ($1, $2, true, true)
-                RETURNING id
-                """,
-                user_a_id, user_b_id
-            )
+        room_id = None
+        try:
+            # 1. Insert room record
+            res_room = db.table("rooms").insert({
+                "user_a": str(user_a_id),
+                "user_b": str(user_b_id),
+                "created_by_admin": True,
+                "is_active": True
+            }).execute()
             
-            # Update both users
-            await conn.execute(
-                """
-                UPDATE users
-                SET status = 'matched', room_id = $1
-                WHERE id = $2 OR id = $3
-                """,
-                room_id, user_a_id, user_b_id
-            )
+            if not res_room.data:
+                raise Exception("Failed to insert room row")
+                
+            room_id = res_room.data[0]["id"]
             
-        # Notify connected users via Websockets
-        await notify_match(room_id, user_a_id, user_map[user_b_id], user_b_id, user_map[user_a_id])
+            # 2. Update both users status
+            db.table("users").update({
+                "status": "matched",
+                "room_id": room_id
+            }).in_("id", [str(user_a_id), str(user_b_id)]).execute()
+            
+        except Exception as match_err:
+            print(f"Match assignment execution failed: {match_err}", file=sys.stderr)
+            # Programmatic Rollback: If room was created but user status updates failed, delete the room
+            if room_id:
+                try:
+                    db.table("rooms").delete().eq("id", room_id).execute()
+                except Exception as rollback_err:
+                    print(f"Cleanup rollback failed for room {room_id}: {rollback_err}", file=sys.stderr)
+            raise match_err
+            
+        # Dispatch WS notifications
+        await notify_match(room_id, user_a_id, user_map[str(user_b_id)], user_b_id, user_map[str(user_a_id)])
         
         return {"room_id": room_id}
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Transaction failed matching user_a={user_a_id} and user_b={user_b_id}: {e}", file=sys.stderr)
+        print(f"Match transaction failed for user_a={user_a_id} and user_b={user_b_id}: {e}", file=sys.stderr)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Transaction failed matching users"
+            detail="Failed matching users"
         )
 
 async def notify_match(
-    room_id: UUID,
+    room_id: str,
     user_a_id: UUID,
     user_b_profile: dict,
     user_b_id: UUID,
     user_a_profile: dict
 ) -> None:
     """Helper: Dispatches real-time WebSocket notifications to newly matched users."""
-    import json
-    
-    # Look up in connections registry
-    # Format of message matching the spec:
-    # { "type": "matched", "room_id": "<uuid>", "partner_display_name": "...", "partner_avatar_seed": "..." }
-    
-    # We must scan rooms in connections?
-    # Wait, when a user is waiting, they might not be connected to a room WebSocket yet,
-    # or they might be connected to a waiting room socket, or standard status polling is running.
-    # The spec mentions: "Notify both users via WebSocket if they have active connections (look up in the in-memory connection registry)."
-    # Wait, the connections registry maps: `connections: dict[str, dict[str, WebSocket]]` where key is `room_id` or similar.
-    # Wait, let's see. If the user is waiting, which room id is their connection registered under?
-    # In WS /ws/{room_id}, the client connects to a room. When they are waiting, they don't have a room yet!
-    # Do they connect to a general waiting room socket or `/ws/waiting`?
-    # Wait, the spec only lists: `WS /ws/{room_id}`
-    # Where does it say they connect?
-    # Wait, if they have active connections in `connections`, maybe they connected to `/ws/waiting` or a special key?
-    # Wait, "connections: dict[room_id, dict[user_id, WebSocket]]"
-    # If they are matched, they don't have a room connection *until* they get matched and connect to `WS /ws/{room_id}`!
-    # Ah! But what if they have connections in the registry under some other key (like "waiting" room id or some dummy room ID)?
-    # We can check if their `user_id` is registered under *any* room or special dummy room, and send the notification there if online!
-    # Let's search all rooms in the `connections` dictionary for `user_a_id` and `user_b_id` and dispatch.
-    
     msg_a = {
         "type": "matched",
         "room_id": str(room_id),
@@ -492,39 +440,22 @@ async def notify_match(
                 print(f"Error sending match WS notification to user_b={user_b_id}: {e}", file=sys.stderr)
 
 async def get_admin_rooms(
-    conn: asyncpg.Connection
+    db: Client
 ) -> dict:
-    """Returns all active rooms along with participant profiles."""
+    """Returns all active rooms along with participant profiles (admin only)."""
     try:
-        # Strict: NEVER SELECT * - explicitly name joining columns
-        rows = await conn.fetch(
-            """
-            SELECT r.id, r.created_at,
-                   ua.id as ua_id, ua.display_name as ua_display_name, ua.avatar_seed as ua_avatar_seed,
-                   ub.id as ub_id, ub.display_name as ub_display_name, ub.avatar_seed as ub_avatar_seed
-            FROM rooms r
-            JOIN users ua ON r.user_a = ua.id
-            JOIN users ub ON r.user_b = ub.id
-            WHERE r.is_active = true
-            ORDER BY r.created_at DESC
-            """
-        )
+        # Navigate relationships using parenthesized targeting for multiple user FKs
+        res = db.table("rooms").select(
+            "id, created_at, ua:users!fk_user_a(id, display_name, avatar_seed), ub:users!fk_user_b(id, display_name, avatar_seed)"
+        ).eq("is_active", True).order("created_at", desc=True).execute()
         
         rooms = []
-        for row in rows:
+        for row in res.data:
             rooms.append({
                 "id": row["id"],
                 "created_at": row["created_at"],
-                "user_a": {
-                    "id": row["ua_id"],
-                    "display_name": row["ua_display_name"],
-                    "avatar_seed": row["ua_avatar_seed"]
-                },
-                "user_b": {
-                    "id": row["ub_id"],
-                    "display_name": row["ub_display_name"],
-                    "avatar_seed": row["ub_avatar_seed"]
-                }
+                "user_a": row["ua"],
+                "user_b": row["ub"]
             })
             
         return {"rooms": rooms}
@@ -537,47 +468,36 @@ async def get_admin_rooms(
 
 async def deactivate_room(
     room_id: UUID,
-    conn: asyncpg.Connection
+    db: Client
 ) -> dict:
-    """Closes an active room and resets user statuses back to waiting."""
+    """Closes an active room and resets user statuses back to waiting (admin only)."""
     try:
-        room_row = await conn.fetchrow(
-            "SELECT user_a, user_b, is_active FROM rooms WHERE id = $1",
-            room_id
-        )
-        if not room_row or not room_row["is_active"]:
+        res_room = db.table("rooms").select("user_a, user_b, is_active").eq("id", str(room_id)).execute()
+        if not res_room.data or not res_room.data[0]["is_active"]:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Active room not found"
             )
             
+        room_row = res_room.data[0]
         user_a = room_row["user_a"]
         user_b = room_row["user_b"]
         
-        async with conn.transaction():
-            # Deactivate room
-            await conn.execute(
-                "UPDATE rooms SET is_active = false WHERE id = $1",
-                room_id
-            )
-            # Reset users status
-            await conn.execute(
-                """
-                UPDATE users
-                SET room_id = NULL, status = 'waiting'
-                WHERE id = $1 OR id = $2
-                """,
-                user_a, user_b
-            )
+        try:
+            # 1. Close active status of room
+            db.table("rooms").update({"is_active": False}).eq("id", str(room_id)).execute()
+            # 2. Reset user associations back to waiting
+            db.table("users").update({"room_id": None, "status": "waiting"}).in_("id", [user_a, user_b]).execute()
+        except Exception as deact_err:
+            print(f"Failed programmatically deactivating room: {deact_err}", file=sys.stderr)
+            raise deact_err
             
         # Clean up WebSocket registry and gracefully disconnect
-        # We notify the users over the socket if connected, then close them.
         room_key = str(room_id)
         if room_key in connections:
             user_sockets = connections[room_key]
             for user_id_str, ws in list(user_sockets.items()):
                 try:
-                    # Notify and close
                     await ws.send_text(json.dumps({"type": "deactivated"}))
                     await ws.close(code=4003, reason="Room deactivated by admin")
                 except Exception as e:
@@ -588,8 +508,8 @@ async def deactivate_room(
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Transaction failed during deactivation of room {room_id}: {e}", file=sys.stderr)
+        print(f"Error during deactivation of room {room_id}: {e}", file=sys.stderr)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Database transaction error during deactivation"
+            detail="Database error during deactivation"
         )

@@ -4,9 +4,15 @@ import json
 from uuid import UUID
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
+from dotenv import load_dotenv
+
+# Load local environment variables from .env file
+load_dotenv()
+
 from fastapi import FastAPI, Depends, HTTPException, status, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, HTMLResponse
+
 
 from app.database import init_db, close_db, get_db_connection
 from app.auth import get_current_user, get_current_admin, verify_user_token
@@ -21,7 +27,7 @@ from app.services import (
     get_room_messages, get_admin_users, match_users, get_admin_rooms, deactivate_room
 )
 from app.state import connections
-import asyncpg
+from supabase import Client
 
 # Lifespan manager for DB connection pool
 @asynccontextmanager
@@ -770,11 +776,11 @@ SWAGGER_TEMPLATE = """
 # --- System Metrics & Custom Swagger Console Routes ---
 
 @app.get("/api/public/metrics", status_code=status.HTTP_200_OK, include_in_schema=False)
-async def public_metrics(conn: asyncpg.Connection = Depends(get_db_connection)):
+async def public_metrics(db: Client = Depends(get_db_connection)):
     """Exposes real-time system health and websocket usage counters (public/developer-facing)."""
     db_connected = False
     try:
-        await conn.execute("SELECT 1")
+        db.table("rooms").select("id").limit(1).execute()
         db_connected = True
     except Exception as e:
         print(f"Metrics DB connection check failed: {e}", file=sys.stderr)
@@ -782,7 +788,8 @@ async def public_metrics(conn: asyncpg.Connection = Depends(get_db_connection)):
     active_rooms = 0
     if db_connected:
         try:
-            active_rooms = await conn.fetchval("SELECT COUNT(*) FROM rooms WHERE is_active = true") or 0
+            res = db.table("rooms").select("id", count="exact").eq("is_active", True).execute()
+            active_rooms = res.count if res.count is not None else len(res.data)
         except Exception as e:
             print(f"Metrics rooms query failed: {e}", file=sys.stderr)
 
@@ -809,47 +816,47 @@ async def health_check():
 @app.post("/api/signup", response_model=AuthResponse, status_code=status.HTTP_200_OK, tags=["User Authentication"])
 async def signup(
     body: SignupRequest,
-    conn: asyncpg.Connection = Depends(get_db_connection)
+    db: Client = Depends(get_db_connection)
 ):
     """Signs up a new user and returns their profile with custom JWT."""
-    return await register_user(body.email, body.password, body.quiz_answers, conn)
+    return await register_user(body.email, body.password, body.quiz_answers, db)
 
 @app.post("/api/auth/login", response_model=AuthResponse, status_code=status.HTTP_200_OK, tags=["User Authentication"])
 async def login(
     body: LoginRequest,
-    conn: asyncpg.Connection = Depends(get_db_connection)
+    db: Client = Depends(get_db_connection)
 ):
     """Authenticates user credentials and returns user profile with JWT."""
-    return await authenticate_user(body.email, body.password, conn)
+    return await authenticate_user(body.email, body.password, db)
 
 # --- User Routes ---
 
 @app.get("/api/me/status", response_model=StatusResponse, status_code=status.HTTP_200_OK, tags=["User Operations & Chat"])
 async def get_my_status(
     current_user: dict = Depends(get_current_user),
-    conn: asyncpg.Connection = Depends(get_db_connection)
+    db: Client = Depends(get_db_connection)
 ):
     """Polled by the client waiting room to verify current matchmaking status."""
-    return await get_user_status(current_user["id"], conn)
+    return await get_user_status(current_user["id"], db)
 
 @app.post("/api/user/quiz", status_code=status.HTTP_200_OK, tags=["User Operations & Chat"])
 async def submit_user_quiz(
     body: dict[str, str],
     current_user: dict = Depends(get_current_user),
-    conn: asyncpg.Connection = Depends(get_db_connection)
+    db: Client = Depends(get_db_connection)
 ):
     """Allows authenticated users to submit or update their quiz answers."""
-    return await submit_quiz(current_user["id"], body, conn)
+    return await submit_quiz(current_user["id"], body, db)
 
 @app.get("/api/rooms/{room_id}/messages", response_model=MessagesListResponse, status_code=status.HTTP_200_OK, tags=["User Operations & Chat"])
 async def get_messages(
     room_id: UUID,
     before: UUID | None = Query(None, description="Load messages before this message UUID for pagination"),
     current_user: dict = Depends(get_current_user),
-    conn: asyncpg.Connection = Depends(get_db_connection)
+    db: Client = Depends(get_db_connection)
 ):
     """Fetches up to 50 historical messages for a matched room in ascending order."""
-    messages = await get_room_messages(room_id, current_user["id"], before, conn)
+    messages = await get_room_messages(room_id, current_user["id"], before, db)
     return {"messages": messages}
 
 # --- Admin Auth Endpoints ---
@@ -886,93 +893,106 @@ async def get_all_users(
     page: int = Query(1, ge=1, description="Page index"),
     limit: int = Query(50, ge=1, le=100, description="Page size limit"),
     current_admin: str = Depends(get_current_admin),
-    conn: asyncpg.Connection = Depends(get_db_connection)
+    db: Client = Depends(get_db_connection)
 ):
     """Lists all users registered in the system (admin only)."""
-    return await get_admin_users(search, page, limit, conn)
+    return await get_admin_users(search, page, limit, db)
 
 @app.post("/api/admin/match", response_model=MatchResponse, status_code=status.HTTP_200_OK, tags=["Admin Control Panel"])
 async def match_waiting_users(
     body: MatchRequest,
     current_admin: str = Depends(get_current_admin),
-    conn: asyncpg.Connection = Depends(get_db_connection)
+    db: Client = Depends(get_db_connection)
 ):
     """Matches two waiting users into an active chat room (admin only)."""
-    return await match_users(body.user_a_id, body.user_b_id, conn)
+    return await match_users(body.user_a_id, body.user_b_id, db)
 
 @app.get("/api/admin/rooms", response_model=AdminRoomsListResponse, status_code=status.HTTP_200_OK, tags=["Admin Control Panel"])
 async def get_active_rooms(
     current_admin: str = Depends(get_current_admin),
-    conn: asyncpg.Connection = Depends(get_db_connection)
+    db: Client = Depends(get_db_connection)
 ):
     """Lists all active chat rooms (admin only)."""
-    return await get_admin_rooms(conn)
+    return await get_admin_rooms(db)
 
 @app.post("/api/admin/rooms/{room_id}/deactivate", status_code=status.HTTP_200_OK, tags=["Admin Control Panel"])
 async def deactivate_chat_room(
     room_id: UUID,
     current_admin: str = Depends(get_current_admin),
-    conn: asyncpg.Connection = Depends(get_db_connection)
+    db: Client = Depends(get_db_connection)
 ):
     """Closes an active chat room and resets the status of both users back to waiting (admin only)."""
-    return await deactivate_room(room_id, conn)
+    return await deactivate_room(room_id, db)
 
 # --- Admin CSV Export Endpoints (Streamed Response) ---
 
 async def export_users_csv_stream():
     """Helper: Streams users from DB as CSV chunks without loading all rows in memory."""
-    from app.database import _pool
-    if not _pool:
-        raise RuntimeError("Database pool not initialized")
+    from app.database import get_db_client
+    try:
+        db = get_db_client()
+    except Exception:
+        raise RuntimeError("Database client not initialized")
         
-    async with _pool.acquire() as conn:
-        import io
-        import csv
-        
-        output = io.StringIO()
-        writer = csv.writer(output)
-        
-        # Header
-        writer.writerow(["id", "email", "display_name", "status", "created_at", "q1", "q2", "q3", "q4", "q5"])
-        yield output.getvalue()
-        output.seek(0)
-        output.truncate(0)
-        
-        # Cursor needs transaction
-        async with conn.transaction():
-            async for row in conn.cursor(
-                """
-                SELECT id, email, display_name, status, created_at, quiz_answers
-                FROM users
-                ORDER BY created_at DESC
-                """
-            ):
-                quiz = {}
-                quiz_data = row["quiz_answers"]
-                if quiz_data:
-                    if isinstance(quiz_data, str):
-                        try:
-                            quiz = json.loads(quiz_data)
-                        except Exception:
-                            quiz = {}
-                    elif isinstance(quiz_data, dict):
-                        quiz = quiz_data
-                
-                writer.writerow([
-                    str(row["id"]),
-                    row["email"],
-                    row["display_name"],
-                    row["status"],
-                    row["created_at"].isoformat() if row["created_at"] else "",
-                    quiz.get("q1", ""),
-                    quiz.get("q2", ""),
-                    quiz.get("q3", ""),
-                    quiz.get("q4", ""),
-                    quiz.get("q5", "")
-                ])
-                yield output.getvalue()
-                output.seek(0)
-                output.truncate(0)
+    import io
+    import csv
+    
+    output = io.StringIO()
+    writer = csv.writer(output)
+    
+    # Header
+    writer.writerow(["id", "email", "display_name", "status", "created_at", "q1", "q2", "q3", "q4", "q5"])
+    yield output.getvalue()
+    output.seek(0)
+    output.truncate(0)
+    
+    chunk_size = 100
+    offset = 0
+    while True:
+        try:
+            res = db.table("users").select("id, email, display_name, status, created_at, quiz_answers")\
+                .order("created_at", desc=True)\
+                .range(offset, offset + chunk_size - 1).execute()
+        except Exception as e:
+            print(f"Error exporting users CSV: {e}", file=sys.stderr)
+            break
+            
+        if not res.data:
+            break
+            
+        for row in res.data:
+            quiz = {}
+            quiz_data = row["quiz_answers"]
+            if quiz_data:
+                if isinstance(quiz_data, str):
+                    try:
+                        quiz = json.loads(quiz_data)
+                    except Exception:
+                        quiz = {}
+                elif isinstance(quiz_data, dict):
+                    quiz = quiz_data
+            
+            created_at_str = row["created_at"].isoformat() if hasattr(row["created_at"], "isoformat") else (row["created_at"] or "")
+            
+            writer.writerow([
+                str(row["id"]),
+                row["email"],
+                row["display_name"],
+                row["status"],
+                created_at_str,
+                quiz.get("q1", ""),
+                quiz.get("q2", ""),
+                quiz.get("q3", ""),
+                quiz.get("q4", ""),
+                quiz.get("q5", "")
+            ])
+            yield output.getvalue()
+            output.seek(0)
+            output.truncate(0)
+            
+        if len(res.data) < chunk_size:
+            break
+        offset += chunk_size
 
 @app.get("/api/admin/users/export", tags=["Admin Data Exports"])
 async def export_users_csv(current_admin: str = Depends(get_current_admin)):
@@ -987,55 +1007,68 @@ async def export_users_csv(current_admin: str = Depends(get_current_admin)):
 
 async def export_messages_csv_stream(room_id: UUID | None):
     """Helper: Streams messaging transcripts from DB as CSV chunks without loading all rows in memory."""
-    from app.database import _pool
-    if not _pool:
-        raise RuntimeError("Database pool not initialized")
+    from app.database import get_db_client
+    try:
+        db = get_db_client()
+    except Exception:
+        raise RuntimeError("Database client not initialized")
         
-    async with _pool.acquire() as conn:
-        import io
-        import csv
-        
-        output = io.StringIO()
-        writer = csv.writer(output)
-        
-        # Header
-        writer.writerow(["id", "room_id", "sender_id", "sender_display_name", "content", "sent_at"])
-        yield output.getvalue()
-        output.seek(0)
-        output.truncate(0)
-        
-        # Build query
-        if room_id:
-            query = """
-                SELECT m.id, m.room_id, m.sender_id, u.display_name, m.content, m.sent_at
-                FROM messages m
-                JOIN users u ON m.sender_id = u.id
-                WHERE m.room_id = $1
-                ORDER BY m.sent_at ASC
-            """
-            params = [room_id]
-        else:
-            query = """
-                SELECT m.id, m.room_id, m.sender_id, u.display_name, m.content, m.sent_at
-                FROM messages m
-                JOIN users u ON m.sender_id = u.id
-                ORDER BY m.sent_at ASC
-            """
-            params = []
+    import io
+    import csv
+    
+    output = io.StringIO()
+    writer = csv.writer(output)
+    
+    # Header
+    writer.writerow(["id", "room_id", "sender_id", "sender_display_name", "content", "sent_at"])
+    yield output.getvalue()
+    output.seek(0)
+    output.truncate(0)
+    
+    chunk_size = 100
+    offset = 0
+    while True:
+        try:
+            # We select: id, room_id, sender_id, content, sent_at, users(display_name)
+            query = db.table("messages").select(
+                "id, room_id, sender_id, content, sent_at, users(display_name)"
+            )
+            if room_id:
+                query = query.eq("room_id", str(room_id))
+                
+            res = query.order("sent_at", desc=False).range(offset, offset + chunk_size - 1).execute()
+        except Exception as e:
+            print(f"Error exporting messages CSV: {e}", file=sys.stderr)
+            break
             
-        async with conn.transaction():
-            async for row in conn.cursor(query, *params):
-                writer.writerow([
-                    str(row["id"]),
-                    str(row["room_id"]),
-                    str(row["sender_id"]),
-                    row["display_name"],
-                    row["content"],
-                    row["sent_at"].isoformat() if row["sent_at"] else ""
-                ])
-                yield output.getvalue()
-                output.seek(0)
-                output.truncate(0)
+        if not res.data:
+            break
+            
+        for row in res.data:
+            user_data = row.get("users")
+            display_name = ""
+            if isinstance(user_data, dict):
+                display_name = user_data.get("display_name", "")
+            elif isinstance(user_data, list) and user_data:
+                display_name = user_data[0].get("display_name", "")
+                
+            sent_at_str = row["sent_at"].isoformat() if hasattr(row["sent_at"], "isoformat") else (row["sent_at"] or "")
+            
+            writer.writerow([
+                str(row["id"]),
+                str(row["room_id"]),
+                str(row["sender_id"]),
+                display_name,
+                row["content"],
+                sent_at_str
+            ])
+            yield output.getvalue()
+            output.seek(0)
+            output.truncate(0)
+            
+        if len(res.data) < chunk_size:
+            break
+        offset += chunk_size
 
 @app.get("/api/admin/messages/export", tags=["Admin Data Exports"])
 async def export_messages_csv(
@@ -1071,27 +1104,29 @@ async def websocket_room_handler(websocket: WebSocket, room_id: UUID):
         return
         
     # Verify room is active and user is a participant
-    from app.database import _pool
-    if not _pool:
-        await websocket.close(code=1011, reason="Database pool uninitialized")
+    from app.database import get_db_client
+    try:
+        db = get_db_client()
+    except Exception:
+        await websocket.close(code=1011, reason="Database client uninitialized")
         return
         
-    async with _pool.acquire() as conn:
-        try:
-            room_row = await conn.fetchrow(
-                "SELECT user_a, user_b, is_active FROM rooms WHERE id = $1",
-                room_id
-            )
-        except Exception as e:
-            print(f"Error querying room {room_id} in WS: {e}", file=sys.stderr)
-            await websocket.close(code=1011, reason="Database read error")
+    try:
+        res_room = db.table("rooms").select("user_a, user_b, is_active").eq("id", str(room_id)).execute()
+        if not res_room.data:
+            await websocket.close(code=4003, reason="Active room not found")
             return
+        room_row = res_room.data[0]
+    except Exception as e:
+        print(f"Error querying room {room_id} in WS: {e}", file=sys.stderr)
+        await websocket.close(code=1011, reason="Database read error")
+        return
             
     if not room_row or not room_row["is_active"]:
         await websocket.close(code=4003, reason="Active room not found")
         return
         
-    if room_row["user_a"] != user_id and room_row["user_b"] != user_id:
+    if room_row["user_a"] != str(user_id) and room_row["user_b"] != str(user_id):
         await websocket.close(code=4003, reason="Access to room forbidden")
         return
 
@@ -1124,30 +1159,28 @@ async def websocket_room_handler(websocket: WebSocket, room_id: UUID):
                 continue
                 
             # Log message to database
-            async with _pool.acquire() as conn:
-                try:
-                    msg_row = await conn.fetchrow(
-                        """
-                        INSERT INTO messages (room_id, sender_id, content)
-                        VALUES ($1, $2, $3)
-                        RETURNING id, sent_at
-                        """,
-                        room_id, user_id, content
-                    )
-                except Exception as e:
-                    print(f"Error storing message in room={room_id}, sender={user_id}: {e}", file=sys.stderr)
+            try:
+                res_msg = db.table("messages").insert({
+                    "room_id": str(room_id),
+                    "sender_id": str(user_id),
+                    "content": content
+                }).execute()
+                if not res_msg.data:
                     continue
-                    
-            if not msg_row:
+                msg_row = res_msg.data[0]
+            except Exception as e:
+                print(f"Error storing message in room={room_id}, sender={user_id}: {e}", file=sys.stderr)
                 continue
                 
             # Broadcast message to matched room participants
+            sent_at = msg_row["sent_at"]
+            sent_at_str = sent_at.isoformat() if hasattr(sent_at, "isoformat") else (sent_at or "")
             payload = {
                 "type": "message",
                 "id": str(msg_row["id"]),
                 "sender_id": user_key,
                 "content": content,
-                "sent_at": msg_row["sent_at"].isoformat()
+                "sent_at": sent_at_str
             }
             
             payload_str = json.dumps(payload)

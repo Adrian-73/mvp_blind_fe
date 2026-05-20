@@ -1,44 +1,53 @@
 import os
 import sys
-import asyncpg
-from typing import AsyncGenerator
+from typing import Generator
+from supabase import create_client, Client
 
-_pool: asyncpg.Pool | None = None
+_client: Client | None = None
 
 async def init_db() -> None:
-    """Initializes the asyncpg connection pool."""
-    global _pool
-    database_url = os.getenv("DATABASE_URL")
-    if not database_url:
-        print("DATABASE_URL is missing from the environment variables", file=sys.stderr)
-        raise ValueError("DATABASE_URL environment variable is not set")
+    """Initializes the Supabase HTTP Client using project URL and Service Role Key.
+    
+    By connecting via standard HTTPS (IPv4/IPv6 dual-stack), we bypass Winsock
+    and WSL TCP loopback routing limitations entirely.
+    """
+    global _client
+    url = os.getenv("SUPABASE_URL")
+    key = os.getenv("SUPABASE_KEY")
+    if not url or not key:
+        print("\n" + "="*80, file=sys.stderr)
+        print("CRITICAL CONFIGURATION ERROR: SUPABASE CREDENTIALS MISSING!", file=sys.stderr)
+        print("Please configure both SUPABASE_URL and SUPABASE_KEY (service_role key)", file=sys.stderr)
+        print("inside your local .env file. See implementation_plan.md for details.", file=sys.stderr)
+        print("="*80 + "\n", file=sys.stderr)
+        raise ValueError("SUPABASE_URL and SUPABASE_KEY environment variables are required")
     
     try:
-        _pool = await asyncpg.create_pool(
-            dsn=database_url,
-            min_size=1,
-            max_size=10,
-            command_timeout=60.0
-        )
+        # Create Supabase client using standard HTTP connection
+        _client = create_client(url, key)
+        print("Successfully established Supabase HTTP Client mapping!", file=sys.stderr)
     except Exception as e:
-        print(f"Failed to create asyncpg database pool: {e}", file=sys.stderr)
+        print(f"Failed to initialize Supabase Client mapping: {e}", file=sys.stderr)
         raise e
 
 async def close_db() -> None:
-    """Closes the asyncpg connection pool."""
-    global _pool
-    if _pool:
-        try:
-            await _pool.close()
-        except Exception as e:
-            print(f"Error closing database pool: {e}", file=sys.stderr)
+    """No-op cleanup for the Supabase HTTP Client."""
+    pass
 
-async def get_db_connection() -> AsyncGenerator[asyncpg.Connection, None]:
-    """Dependency that yields a database connection from the pool."""
-    global _pool
-    if not _pool:
-        print("Database connection pool is not initialized", file=sys.stderr)
-        raise RuntimeError("Database pool has not been initialized.")
+def get_db_client() -> Client:
+    """Retrieves the active, initialized Supabase Client."""
+    global _client
+    if not _client:
+        raise RuntimeError("Supabase Client has not been initialized. Call init_db() first.")
+    return _client
+
+def get_db_connection() -> Generator[Client, None, None]:
+    """Dependency that yields the active Supabase Client.
     
-    async with _pool.acquire() as connection:
-        yield connection
+    Retains the exact name 'get_db_connection' to maintain compatibility with 
+    FastAPI dependency injection layers without causing compilation issues.
+    """
+    global _client
+    if not _client:
+        raise RuntimeError("Supabase Client has not been initialized.")
+    yield _client

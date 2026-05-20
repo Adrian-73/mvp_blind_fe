@@ -6,7 +6,7 @@ from passlib.context import CryptContext
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from app.database import get_db_connection
-import asyncpg
+from supabase import Client
 
 # Password hashing configuration
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -109,27 +109,20 @@ def verify_admin_token(token: str) -> str:
 
 async def get_current_user(
     token: str = Depends(oauth2_scheme),
-    conn: asyncpg.Connection = Depends(get_db_connection)
+    db: Client = Depends(get_db_connection)
 ) -> dict:
     """FastAPI Dependency: Authenticates a standard user and returns their database row."""
     user_id = verify_user_token(token)
     
     try:
-        # Strict: NEVER SELECT * - always name columns explicitly
-        row = await conn.fetchrow(
-            """
-            SELECT id, email, display_name, avatar_seed, quiz_answers, status, room_id, created_at
-            FROM users
-            WHERE id = $1
-            """,
-            user_id
-        )
-        if not row:
+        # Perform HTTP select using the Supabase client
+        res = db.table("users").select("id, email, display_name, avatar_seed, quiz_answers, status, room_id, created_at").eq("id", user_id).execute()
+        if not res.data:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="User not found"
             )
-        return dict(row)
+        return res.data[0]
     except HTTPException:
         raise
     except Exception as e:
