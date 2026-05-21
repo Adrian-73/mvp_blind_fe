@@ -14,6 +14,13 @@ class LoginRequest(BaseModel):
     email: EmailStr
     password: str
 
+class SendOtpRequest(BaseModel):
+    email: EmailStr
+
+class VerifyOtpRequest(BaseModel):
+    email: EmailStr
+    otp_code: str = Field(..., min_length=6, max_length=6)
+
 class UserResponse(BaseModel):
     id: UUID
     display_name: str
@@ -92,6 +99,7 @@ class AdminUserBrief(BaseModel):
 class AdminRoomResponse(BaseModel):
     id: UUID
     created_at: datetime
+    is_active: bool
     user_a: AdminUserBrief
     user_b: AdminUserBrief
 

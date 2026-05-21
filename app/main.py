@@ -18,13 +18,15 @@ from app.database import init_db, close_db, get_db_connection
 from app.auth import get_current_user, get_current_admin, verify_user_token
 from app.schemas import (
     SignupRequest, LoginRequest, AuthResponse,
+    SendOtpRequest, VerifyOtpRequest,
     StatusResponse, MessagesListResponse, MessageResponse,
     AdminLoginRequest, AdminTokenResponse, AdminUsersListResponse,
     MatchRequest, MatchResponse, AdminRoomsListResponse
 )
 from app.services import (
     register_user, authenticate_user, get_user_status, submit_quiz,
-    get_room_messages, get_admin_users, match_users, get_admin_rooms, deactivate_room
+    get_room_messages, get_admin_users, match_users, get_admin_rooms, deactivate_room,
+    send_email_otp, verify_email_otp
 )
 from app.state import connections
 from supabase import Client
@@ -773,6 +775,84 @@ SWAGGER_TEMPLATE = """
 </html>
 """
 
+# --- Dynamic Setup Page Template ---
+
+SETUP_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Database Setup Required</title>
+    <link rel="shortcut icon" href="https://fastapi.tiangolo.com/img/favicon.png">
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Outfit:wght@500;600;700;800&family=Fira+Code:wght@400;500&display=swap');
+        body {
+            background-color: #0b0f19;
+            background-image: radial-gradient(circle at 50% 0px, #1e1b4b 0%, #0b0f19 800px);
+            margin: 0; font-family: 'Inter', sans-serif; color: #cbd5e1;
+            display: flex; justify-content: center; align-items: center; min-height: 100vh;
+        }
+        .container {
+            background: rgba(30, 41, 59, 0.35); backdrop-filter: blur(12px);
+            border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 16px;
+            padding: 40px; max-width: 800px; width: 90%; box-shadow: 0 4px 30px rgba(0, 0, 0, 0.15);
+        }
+        h1 { font-family: 'Outfit', sans-serif; color: #f3f4f6; margin-top: 0; }
+        p { line-height: 1.6; }
+        .sql-container {
+            background: #1e293b; border-radius: 8px; padding: 20px;
+            overflow-x: auto; font-family: 'Fira Code', monospace;
+            font-size: 13px; color: #34d399; position: relative;
+            margin: 20px 0; border: 1px solid rgba(255,255,255,0.1);
+        }
+        .copy-btn {
+            position: absolute; top: 10px; right: 10px;
+            background: #4f46e5; color: white; border: none;
+            padding: 6px 12px; border-radius: 6px; cursor: pointer;
+            font-family: 'Inter', sans-serif; font-size: 12px; font-weight: 500;
+        }
+        .copy-btn:hover { background: #4338ca; }
+        .refresh-btn {
+            background: #ec4899; color: white; border: none;
+            padding: 12px 24px; border-radius: 8px; cursor: pointer;
+            font-family: 'Inter', sans-serif; font-size: 14px; font-weight: 600;
+            display: block; margin: 0 auto; margin-top: 30px;
+        }
+        .refresh-btn:hover { background: #be185d; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>⚠️ Database Setup Required</h1>
+        <p>It looks like your Supabase database hasn't been initialized with the required tables yet. Since we use the secure Supabase HTTP API, we cannot execute Data Definition (DDL) queries directly.</p>
+        <p><strong>Action Required:</strong> Please copy the SQL snippet below and run it inside your <a href="https://supabase.com/dashboard/project/_/sql" target="_blank" style="color: #c084fc;">Supabase Dashboard SQL Editor</a>.</p>
+        
+        <div class="sql-container">
+            <button class="copy-btn" onclick="copySql(this)">Copy SQL</button>
+            <pre id="sql-content">{{SCHEMA_SQL}}</pre>
+        </div>
+
+        <button class="refresh-btn" onclick="window.location.reload()">I've run the SQL - Refresh</button>
+    </div>
+
+    <script>
+        function copySql(btn) {
+            const sql = document.getElementById('sql-content').innerText;
+            navigator.clipboard.writeText(sql).then(() => {
+                const originalText = btn.innerText;
+                btn.innerText = 'Copied!';
+                btn.style.background = '#10b981';
+                setTimeout(() => {
+                    btn.innerText = originalText;
+                    btn.style.background = '#4f46e5';
+                }, 2000);
+            });
+        }
+    </script>
+</body>
+</html>
+"""
+
 # --- System Metrics & Custom Swagger Console Routes ---
 
 @app.get("/api/public/metrics", status_code=status.HTTP_200_OK, include_in_schema=False)
@@ -802,8 +882,27 @@ async def public_metrics(db: Client = Depends(get_db_connection)):
     }
 
 @app.get("/docs", include_in_schema=False)
-async def custom_swagger_docs():
-    """Renders the custom premium developer console with interactive JWT generator."""
+async def custom_swagger_docs(db: Client = Depends(get_db_connection)):
+    """Renders the custom premium developer console or a Setup UI if the database is empty."""
+    db_connected = False
+    try:
+        db.table("rooms").select("id").limit(1).execute()
+        db_connected = True
+    except Exception as e:
+        print(f"Schema detection check failed (likely missing tables): {e}", file=sys.stderr)
+        
+    if not db_connected:
+        try:
+            with open("schema.sql", "r", encoding="utf-8") as f:
+                schema_content = f.read()
+        except FileNotFoundError:
+            schema_content = "-- schema.sql file not found!"
+            
+        return HTMLResponse(
+            content=SETUP_TEMPLATE.replace("{{SCHEMA_SQL}}", schema_content), 
+            status_code=status.HTTP_200_OK
+        )
+        
     return HTMLResponse(content=SWAGGER_TEMPLATE, status_code=status.HTTP_200_OK)
 
 @app.get("/health", status_code=status.HTTP_200_OK, tags=["System Health"])
@@ -829,6 +928,22 @@ async def login(
     """Authenticates user credentials and returns user profile with JWT."""
     return await authenticate_user(body.email, body.password, db)
 
+@app.post("/api/auth/send-otp", status_code=status.HTTP_200_OK, tags=["User Authentication"])
+async def send_otp(
+    body: SendOtpRequest,
+    db: Client = Depends(get_db_connection)
+):
+    """Generates an email OTP, stores it with a 10-minute expiry, and triggers an email simulation."""
+    return await send_email_otp(body.email, db)
+
+@app.post("/api/auth/verify-otp", response_model=AuthResponse, status_code=status.HTTP_200_OK, tags=["User Authentication"])
+async def verify_otp(
+    body: VerifyOtpRequest,
+    db: Client = Depends(get_db_connection)
+):
+    """Verifies the provided OTP against the database and logs the user in (or auto-registers them)."""
+    return await verify_email_otp(body.email, body.otp_code, db)
+
 # --- User Routes ---
 
 @app.get("/api/me/status", response_model=StatusResponse, status_code=status.HTTP_200_OK, tags=["User Operations & Chat"])
@@ -838,6 +953,19 @@ async def get_my_status(
 ):
     """Polled by the client waiting room to verify current matchmaking status."""
     return await get_user_status(current_user["id"], db)
+
+@app.post("/api/me/unmatch", status_code=status.HTTP_200_OK, tags=["User Operations & Chat"])
+async def unmatch_from_room(
+    current_user: dict = Depends(get_current_user),
+    db: Client = Depends(get_db_connection)
+):
+    """Allows a user to leave their current active chat room and return to the waiting pool."""
+    res = db.table("users").select("room_id").eq("id", current_user["id"]).execute()
+    if not res.data or not res.data[0]["room_id"]:
+        raise HTTPException(status_code=400, detail="You are not currently in an active room.")
+    
+    room_id = res.data[0]["room_id"]
+    return await deactivate_room(UUID(room_id), db, reason="User left the chat")
 
 @app.post("/api/user/quiz", status_code=status.HTTP_200_OK, tags=["User Operations & Chat"])
 async def submit_user_quiz(
@@ -908,12 +1036,13 @@ async def match_waiting_users(
     return await match_users(body.user_a_id, body.user_b_id, db)
 
 @app.get("/api/admin/rooms", response_model=AdminRoomsListResponse, status_code=status.HTTP_200_OK, tags=["Admin Control Panel"])
-async def get_active_rooms(
+async def get_rooms_list(
+    status_filter: str = Query("active", description="Filter by status: 'active', 'inactive', or 'all'"),
     current_admin: str = Depends(get_current_admin),
     db: Client = Depends(get_db_connection)
 ):
-    """Lists all active chat rooms (admin only)."""
-    return await get_admin_rooms(db)
+    """Lists chat rooms based on their active status (admin only)."""
+    return await get_admin_rooms(db, status_filter)
 
 @app.post("/api/admin/rooms/{room_id}/deactivate", status_code=status.HTTP_200_OK, tags=["Admin Control Panel"])
 async def deactivate_chat_room(

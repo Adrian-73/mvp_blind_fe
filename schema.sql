@@ -42,3 +42,10 @@ create table user_credentials (
 );
 
 create index idx_messages_room_sent on messages(room_id, sent_at asc);
+
+-- Create table for managing short-lived Email OTPs
+create table email_otps (
+  email text primary key,
+  otp_code text not null,
+  expires_at timestamptz not null
+);

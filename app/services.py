@@ -1,7 +1,8 @@
 import sys
 import json
 import random
-from datetime import datetime, timezone
+import string
+from datetime import datetime, timezone, timedelta
 from uuid import UUID
 from fastapi import HTTPException, status
 from supabase import Client
@@ -345,7 +346,7 @@ async def match_users(
         )
 
     try:
-        res_users = db.table("users").select("id, status, display_name, avatar_seed").in_("id", [str(user_a_id), str(user_b_id)]).execute()
+        res_users = db.table("users").select("id, email, status, display_name, avatar_seed").in_("id", [str(user_a_id), str(user_b_id)]).execute()
         
         if len(res_users.data) != 2:
             raise HTTPException(
@@ -391,7 +392,15 @@ async def match_users(
                 except Exception as rollback_err:
                     print(f"Cleanup rollback failed for room {room_id}: {rollback_err}", file=sys.stderr)
             raise match_err
-            
+        # Simulate Email Match Notifications
+        email_a = user_map[str(user_a_id)]["email"]
+        email_b = user_map[str(user_b_id)]["email"]
+        name_a = user_map[str(user_a_id)]["display_name"]
+        name_b = user_map[str(user_b_id)]["display_name"]
+        
+        print(f"\n{'='*50}\n[MOCK EMAIL] To: {email_a}\nSubject: You have a new match!\n\nYou've been matched with {name_b}. Jump into the chat now!\n{'='*50}\n", file=sys.stderr)
+        print(f"\n{'='*50}\n[MOCK EMAIL] To: {email_b}\nSubject: You have a new match!\n\nYou've been matched with {name_a}. Jump into the chat now!\n{'='*50}\n", file=sys.stderr)
+        
         # Dispatch WS notifications
         await notify_match(room_id, user_a_id, user_map[str(user_b_id)], user_b_id, user_map[str(user_a_id)])
         
@@ -440,20 +449,29 @@ async def notify_match(
                 print(f"Error sending match WS notification to user_b={user_b_id}: {e}", file=sys.stderr)
 
 async def get_admin_rooms(
-    db: Client
+    db: Client,
+    status_filter: str = "active"
 ) -> dict:
-    """Returns all active rooms along with participant profiles (admin only)."""
+    """Returns rooms based on the active status filter along with participant profiles."""
     try:
         # Navigate relationships using parenthesized targeting for multiple user FKs
-        res = db.table("rooms").select(
-            "id, created_at, ua:users!fk_user_a(id, display_name, avatar_seed), ub:users!fk_user_b(id, display_name, avatar_seed)"
-        ).eq("is_active", True).order("created_at", desc=True).execute()
+        query = db.table("rooms").select(
+            "id, created_at, is_active, ua:users!fk_user_a(id, display_name, avatar_seed), ub:users!fk_user_b(id, display_name, avatar_seed)"
+        ).order("created_at", desc=True)
+        
+        if status_filter == "active":
+            query = query.eq("is_active", True)
+        elif status_filter == "inactive":
+            query = query.eq("is_active", False)
+            
+        res = query.execute()
         
         rooms = []
         for row in res.data:
             rooms.append({
                 "id": row["id"],
                 "created_at": row["created_at"],
+                "is_active": row["is_active"],
                 "user_a": row["ua"],
                 "user_b": row["ub"]
             })
@@ -468,9 +486,10 @@ async def get_admin_rooms(
 
 async def deactivate_room(
     room_id: UUID,
-    db: Client
+    db: Client,
+    reason: str = "Room deactivated by admin"
 ) -> dict:
-    """Closes an active room and resets user statuses back to waiting (admin only)."""
+    """Closes an active room and resets user statuses back to waiting."""
     try:
         res_room = db.table("rooms").select("user_a, user_b, is_active").eq("id", str(room_id)).execute()
         if not res_room.data or not res_room.data[0]["is_active"]:
@@ -499,7 +518,7 @@ async def deactivate_room(
             for user_id_str, ws in list(user_sockets.items()):
                 try:
                     await ws.send_text(json.dumps({"type": "deactivated"}))
-                    await ws.close(code=4003, reason="Room deactivated by admin")
+                    await ws.close(code=4003, reason=reason)
                 except Exception as e:
                     print(f"Error closing WebSocket on deactivation for user={user_id_str}: {e}", file=sys.stderr)
             connections.pop(room_key, None)
@@ -512,4 +531,111 @@ async def deactivate_room(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Database error during deactivation"
+        )
+
+async def send_email_otp(email: str, db: Client) -> dict:
+    """Generates a 6-digit OTP, stores it with expiry, and simulates sending an email."""
+    # Generate 6-digit code
+    otp_code = ''.join(random.choices(string.digits, k=6))
+    
+    # 10 minutes expiry
+    expires_at = (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()
+    
+    try:
+        db.table("email_otps").upsert({
+            "email": email,
+            "otp_code": otp_code,
+            "expires_at": expires_at
+        }).execute()
+        
+        # Simulate Email Delivery securely to the console
+        print(f"\n{'='*50}\n[MOCK EMAIL] To: {email}\nSubject: Your Login Code\n\nYour one-time password is: {otp_code}\nIt expires in 10 minutes.\n{'='*50}\n", file=sys.stderr)
+        
+        return {"status": "success", "message": "OTP sent successfully"}
+    except Exception as e:
+        print(f"Error sending OTP for {email}: {e}", file=sys.stderr)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to generate OTP"
+        )
+
+async def verify_email_otp(email: str, otp_code: str, db: Client) -> dict:
+    """Verifies the OTP. If valid, acts as login (or auto-signup if user doesn't exist)."""
+    try:
+        # Check OTP
+        res = db.table("email_otps").select("*").eq("email", email).execute()
+        if not res.data:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired OTP")
+            
+        record = res.data[0]
+        if record["otp_code"] != otp_code:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired OTP")
+            
+        expires_at = datetime.fromisoformat(record["expires_at"].replace("Z", "+00:00"))
+        if datetime.now(timezone.utc) > expires_at:
+            # Delete expired record
+            db.table("email_otps").delete().eq("email", email).execute()
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired OTP")
+            
+        # OTP is valid, delete it to prevent reuse
+        db.table("email_otps").delete().eq("email", email).execute()
+        
+        # Check if user exists
+        user_res = db.table("users").select("*").eq("email", email).execute()
+        if user_res.data:
+            # User exists, proceed with login
+            user_row = user_res.data[0]
+            token = create_user_token(str(user_row["id"]))
+            return {
+                "token": token,
+                "user": {
+                    "id": user_row["id"],
+                    "display_name": user_row["display_name"],
+                    "avatar_seed": user_row["avatar_seed"],
+                    "status": user_row["status"]
+                }
+            }
+        else:
+            # Auto-signup
+            display_name = generate_display_name()
+            for _ in range(5):
+                name_res = db.table("users").select("id").eq("display_name", display_name).execute()
+                if not name_res.data:
+                    break
+                display_name = generate_display_name()
+            else:
+                display_name = f"{display_name}{random.randint(10, 99)}"
+                
+            avatar_seed = generate_avatar_seed()
+            
+            insert_res = db.table("users").insert({
+                "email": email,
+                "display_name": display_name,
+                "avatar_seed": avatar_seed,
+                "quiz_answers": {},
+                "status": "waiting"
+            }).execute()
+            
+            if not insert_res.data:
+                raise Exception("Failed to insert user profile row")
+                
+            new_user = insert_res.data[0]
+            token = create_user_token(str(new_user["id"]))
+            return {
+                "token": token,
+                "user": {
+                    "id": new_user["id"],
+                    "display_name": new_user["display_name"],
+                    "avatar_seed": new_user["avatar_seed"],
+                    "status": new_user["status"]
+                }
+            }
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error verifying OTP for {email}: {e}", file=sys.stderr)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Authentication failed"
         )
