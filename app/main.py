@@ -1369,13 +1369,13 @@ async def websocket_room_handler(websocket: WebSocket, room_id: UUID):
     except WebSocketDisconnect:
         pass
     finally:
-        # Gracefully dequeue socket on closure
-        try:
-            connections[room_key].pop(user_key, None)
-            if not connections[room_key]:
+        # Only dequeue if the slot still holds *this* socket: after a reconnect the new socket
+        # already owns it, and popping it would silently cut that user off from all messages
+        room_sockets = connections.get(room_key)
+        if room_sockets is not None and room_sockets.get(user_key) is websocket:
+            room_sockets.pop(user_key, None)
+            if not room_sockets:
                 connections.pop(room_key, None)
-        except Exception:
-            pass
 
 # --- Frontend (Svelte build copied into app/static by .githooks/pre-push) ---
 # Mounted last so every API, docs and WebSocket route above takes precedence.
