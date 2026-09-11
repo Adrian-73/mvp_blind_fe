@@ -47,5 +47,9 @@ create index idx_messages_room_sent on messages(room_id, sent_at asc);
 create table email_otps (
   email text primary key,
   otp_code text not null,
-  expires_at timestamptz not null
+  expires_at timestamptz not null,
+  attempts integer not null default 0
 );
+
+-- Migration for existing databases created before the "attempts" lockout counter existed:
+-- alter table email_otps add column if not exists attempts integer not null default 0;

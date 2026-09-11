@@ -294,21 +294,37 @@ async def get_room_messages(
             detail="Database error"
         )
 
+def _escape_postgrest_value(value: str) -> str:
+    """Escapes a value for safe interpolation into a PostgREST filter string.
+
+    PostgREST treats comma, dot, and parentheses as filter syntax. Wrapping the
+    value in double quotes neutralizes them, so any backslashes/quotes already
+    present in the value must themselves be escaped first (per PostgREST's
+    quoted-value syntax) to prevent breaking out of the quoted string.
+    """
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
 async def get_admin_users(
     search: str | None,
     page: int,
     limit: int,
-    db: Client
+    db: Client,
+    status_filter: str | None = None
 ) -> dict:
     """Returns a list of users filtered by search keyword and paginated (admin only)."""
     offset = (page - 1) * limit
-    
+
     try:
         query = db.table("users").select("id, email, display_name, avatar_seed, status, room_id, quiz_answers, created_at", count="exact")
-        
+
         if search:
-            query = query.or_(f"email.ilike.%{search}%,display_name.ilike.%{search}%")
-            
+            pattern = _escape_postgrest_value(f"%{search}%")
+            query = query.or_(f"email.ilike.{pattern},display_name.ilike.{pattern}")
+
+        if status_filter:
+            query = query.eq("status", status_filter)
+
         res = query.order("created_at", desc=True).range(offset, offset + limit - 1).execute()
         
         users = []
@@ -363,6 +379,7 @@ async def match_users(
             )
             
         room_id = None
+        matched_ids: list[str] = []
         try:
             # 1. Insert room record
             res_room = db.table("rooms").insert({
@@ -371,21 +388,38 @@ async def match_users(
                 "created_by_admin": True,
                 "is_active": True
             }).execute()
-            
+
             if not res_room.data:
                 raise Exception("Failed to insert room row")
-                
+
             room_id = res_room.data[0]["id"]
-            
-            # 2. Update both users status
-            db.table("users").update({
+
+            # 2. Update both users status, conditioned on them still being "waiting".
+            # This is a compare-and-swap: if a concurrent admin match request already
+            # flipped one of these users' status between our check above and now, the
+            # eq("status", "waiting") clause means that row is silently excluded from
+            # the update instead of being clobbered, so we can detect and roll back.
+            res_update = db.table("users").update({
                 "status": "matched",
                 "room_id": room_id
-            }).in_("id", [str(user_a_id), str(user_b_id)]).execute()
-            
+            }).in_("id", [str(user_a_id), str(user_b_id)]).eq("status", "waiting").execute()
+
+            matched_ids = [row["id"] for row in (res_update.data or [])]
+            if len(matched_ids) != 2:
+                raise Exception(
+                    f"Race condition: expected to match 2 users but only matched {len(matched_ids)} "
+                    f"(one or both users were matched concurrently by another request)"
+                )
+
         except Exception as match_err:
             print(f"Match assignment execution failed: {match_err}", file=sys.stderr)
-            # Programmatic Rollback: If room was created but user status updates failed, delete the room
+            # Programmatic Rollback: revert any partially-applied user status change,
+            # then delete the room, so a failed/raced match leaves no half-applied state.
+            if matched_ids:
+                try:
+                    db.table("users").update({"status": "waiting", "room_id": None}).in_("id", matched_ids).execute()
+                except Exception as rollback_err:
+                    print(f"Cleanup rollback failed for users {matched_ids}: {rollback_err}", file=sys.stderr)
             if room_id:
                 try:
                     db.table("rooms").delete().eq("id", room_id).execute()
@@ -537,15 +571,17 @@ async def send_email_otp(email: str, db: Client) -> dict:
     """Generates a 6-digit OTP, stores it with expiry, and simulates sending an email."""
     # Generate 6-digit code
     otp_code = ''.join(random.choices(string.digits, k=6))
-    
+
     # 10 minutes expiry
     expires_at = (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()
-    
+
     try:
+        # Requesting a fresh OTP resets the failed-attempt counter for a clean slate.
         db.table("email_otps").upsert({
             "email": email,
             "otp_code": otp_code,
-            "expires_at": expires_at
+            "expires_at": expires_at,
+            "attempts": 0
         }).execute()
         
         # Simulate Email Delivery securely to the console
@@ -559,6 +595,8 @@ async def send_email_otp(email: str, db: Client) -> dict:
             detail="Failed to generate OTP"
         )
 
+MAX_OTP_ATTEMPTS = 5
+
 async def verify_email_otp(email: str, otp_code: str, db: Client) -> dict:
     """Verifies the OTP. If valid, acts as login (or auto-signup if user doesn't exist)."""
     try:
@@ -566,17 +604,27 @@ async def verify_email_otp(email: str, otp_code: str, db: Client) -> dict:
         res = db.table("email_otps").select("*").eq("email", email).execute()
         if not res.data:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired OTP")
-            
+
         record = res.data[0]
-        if record["otp_code"] != otp_code:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired OTP")
-            
+
         expires_at = datetime.fromisoformat(record["expires_at"].replace("Z", "+00:00"))
         if datetime.now(timezone.utc) > expires_at:
             # Delete expired record
             db.table("email_otps").delete().eq("email", email).execute()
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired OTP")
-            
+
+        attempts = record.get("attempts") or 0
+        if attempts >= MAX_OTP_ATTEMPTS:
+            # Too many failed guesses: burn the code so it can't be brute-forced further.
+            # The user must request a fresh OTP to try again.
+            db.table("email_otps").delete().eq("email", email).execute()
+            raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Too many attempts. Please request a new code.")
+
+        if record["otp_code"] != otp_code:
+            # Record the failed attempt so repeated guesses eventually get locked out.
+            db.table("email_otps").update({"attempts": attempts + 1}).eq("email", email).execute()
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired OTP")
+
         # OTP is valid, delete it to prevent reuse
         db.table("email_otps").delete().eq("email", email).execute()
         

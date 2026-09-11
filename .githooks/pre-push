@@ -1,0 +1,40 @@
+#!/bin/sh
+# Rebuilds the frontend (../mvpfe) and mirrors its dist/ into app/static before
+# every push. If the build output changed, it is committed and the push is
+# stopped so the next push includes it. Skip once with: git push --no-verify
+#
+# Enable once per clone: git config core.hooksPath .githooks
+
+cd "$(git rev-parse --show-toplevel)" || exit 1
+
+frontend_dir="${FRONTEND_DIR:-../mvpfe}"
+static_dir="app/static"
+
+# Only run when the current branch tip is being pushed (not other branches, tags or deletes)
+head_sha=$(git rev-parse -q --verify HEAD) || exit 0
+pushing_head=no
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [ "$local_sha" = "$head_sha" ] && pushing_head=yes
+done
+[ "$pushing_head" = yes ] || exit 0
+
+if [ ! -f "$frontend_dir/package.json" ]; then
+  echo "pre-push: frontend not found at $frontend_dir (set FRONTEND_DIR or push with --no-verify)" >&2
+  exit 1
+fi
+
+echo "pre-push: building frontend in $frontend_dir" >&2
+(
+  cd "$frontend_dir" &&
+  { [ -d node_modules ] || npm ci; } &&
+  npm run build
+) </dev/null || { echo "pre-push: frontend build failed, push aborted" >&2; exit 1; }
+
+rm -rf "$static_dir" && mkdir -p "$static_dir" && cp -R "$frontend_dir/dist/." "$static_dir/" || exit 1
+
+git add -A -- "$static_dir"
+git diff --cached --quiet -- "$static_dir" && exit 0
+
+git commit -q -m "chore: update frontend build" -- "$static_dir" || exit 1
+echo "pre-push: committed updated frontend build to $static_dir - push again to include it" >&2
+exit 1

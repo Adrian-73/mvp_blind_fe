@@ -1,0 +1,4 @@
+# Hooks run under sh, so keep LF endings even with core.autocrlf
+.githooks/* text eol=lf
+# Generated frontend build: commit exactly what Vite emits
+app/static/** -text

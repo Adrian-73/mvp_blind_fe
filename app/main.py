@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import time
 from uuid import UUID
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
@@ -12,6 +13,7 @@ load_dotenv()
 from fastapi import FastAPI, Depends, HTTPException, status, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, HTMLResponse
+from fastapi.staticfiles import StaticFiles
 
 
 from app.database import init_db, close_db, get_db_connection
@@ -1003,8 +1005,9 @@ async def admin_login(body: AdminLoginRequest):
         )
         
     from app.auth import verify_password, create_admin_token
-    
-    if body.username != admin_user or not verify_password(body.password, admin_pwd_hash):
+    import hmac
+
+    if not hmac.compare_digest(body.username, admin_user) or not verify_password(body.password, admin_pwd_hash):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid admin credentials"
@@ -1020,11 +1023,12 @@ async def get_all_users(
     search: str | None = Query(None, description="Search by email or display name"),
     page: int = Query(1, ge=1, description="Page index"),
     limit: int = Query(50, ge=1, le=100, description="Page size limit"),
+    status_filter: str | None = Query(None, alias="status", description="Filter by user status: 'waiting' or 'matched'"),
     current_admin: str = Depends(get_current_admin),
     db: Client = Depends(get_db_connection)
 ):
     """Lists all users registered in the system (admin only)."""
-    return await get_admin_users(search, page, limit, db)
+    return await get_admin_users(search, page, limit, db, status_filter)
 
 @app.post("/api/admin/match", response_model=MatchResponse, status_code=status.HTTP_200_OK, tags=["Admin Control Panel"])
 async def match_waiting_users(
@@ -1055,6 +1059,17 @@ async def deactivate_chat_room(
 
 # --- Admin CSV Export Endpoints (Streamed Response) ---
 
+def _sanitize_csv_field(value):
+    """Neutralizes CSV/formula injection (OWASP): if a field starts with a character
+    that spreadsheet apps (Excel, Sheets) interpret as a formula trigger, prefix it
+    with a single quote so it's treated as plain text on open, since fields like
+    email, display name, and chat content are user-controlled.
+    """
+    text = "" if value is None else str(value)
+    if text and text[0] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + text
+    return text
+
 async def export_users_csv_stream():
     """Helper: Streams users from DB as CSV chunks without loading all rows in memory."""
     from app.database import get_db_client
@@ -1062,10 +1077,10 @@ async def export_users_csv_stream():
         db = get_db_client()
     except Exception:
         raise RuntimeError("Database client not initialized")
-        
+
     import io
     import csv
-    
+
     output = io.StringIO()
     writer = csv.writer(output)
     
@@ -1105,15 +1120,15 @@ async def export_users_csv_stream():
             
             writer.writerow([
                 str(row["id"]),
-                row["email"],
-                row["display_name"],
+                _sanitize_csv_field(row["email"]),
+                _sanitize_csv_field(row["display_name"]),
                 row["status"],
                 created_at_str,
-                quiz.get("q1", ""),
-                quiz.get("q2", ""),
-                quiz.get("q3", ""),
-                quiz.get("q4", ""),
-                quiz.get("q5", "")
+                _sanitize_csv_field(quiz.get("q1", "")),
+                _sanitize_csv_field(quiz.get("q2", "")),
+                _sanitize_csv_field(quiz.get("q3", "")),
+                _sanitize_csv_field(quiz.get("q4", "")),
+                _sanitize_csv_field(quiz.get("q5", ""))
             ])
             yield output.getvalue()
             output.seek(0)
@@ -1187,8 +1202,8 @@ async def export_messages_csv_stream(room_id: UUID | None):
                 str(row["id"]),
                 str(row["room_id"]),
                 str(row["sender_id"]),
-                display_name,
-                row["content"],
+                _sanitize_csv_field(display_name),
+                _sanitize_csv_field(row["content"]),
                 sent_at_str
             ])
             yield output.getvalue()
@@ -1266,12 +1281,25 @@ async def websocket_room_handler(websocket: WebSocket, room_id: UUID):
     # Accept handshake
     await websocket.accept()
     connections[room_key][user_key] = websocket
-    
+
+    # Simple sliding-window rate limit to stop a single connection from spamming
+    # unlimited messages/DB writes: at most 10 messages per rolling 5-second window.
+    RATE_LIMIT_MAX_MESSAGES = 10
+    RATE_LIMIT_WINDOW_SECONDS = 5
+    message_timestamps: list[float] = []
+
     try:
         while True:
             # Await messaging loop
             text_data = await websocket.receive_text()
-            
+
+            now = time.monotonic()
+            message_timestamps[:] = [t for t in message_timestamps if now - t < RATE_LIMIT_WINDOW_SECONDS]
+            if len(message_timestamps) >= RATE_LIMIT_MAX_MESSAGES:
+                # Silently drop messages sent over the limit instead of processing them
+                continue
+            message_timestamps.append(now)
+
             try:
                 data = json.loads(text_data)
                 content = data.get("content", "")
@@ -1332,3 +1360,12 @@ async def websocket_room_handler(websocket: WebSocket, room_id: UUID):
                 connections.pop(room_key, None)
         except Exception:
             pass
+
+# --- Frontend (Svelte build copied into app/static by .githooks/pre-push) ---
+# Mounted last so every API, docs and WebSocket route above takes precedence.
+
+STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
+if os.path.isdir(STATIC_DIR):
+    app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="frontend")
+else:
+    print(f"Frontend build not found at {STATIC_DIR}; serving API only", file=sys.stderr)
