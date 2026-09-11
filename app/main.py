@@ -691,6 +691,11 @@ SWAGGER_TEMPLATE = """
                     body: JSON.stringify({
                         email: testEmail,
                         password: testPassword,
+                        gender: "female",
+                        interested_in: ["male"],
+                        state: "Karnataka",
+                        bio: "Auto-registered sandbox user for exercising the API.",
+                        single_reason: "Just a test account, married to the API.",
                         quiz_answers: {
                             q1: "spontaneous",
                             q2: "introvert",
@@ -921,7 +926,7 @@ async def signup(
     db: Client = Depends(get_db_connection)
 ):
     """Signs up a new user and returns their profile with custom JWT."""
-    return await register_user(body.email, body.password, body.quiz_answers, db)
+    return await register_user(body.email, body.password, body.quiz_answers, body.profile_fields(), db)
 
 @app.post("/api/auth/login", response_model=AuthResponse, status_code=status.HTTP_200_OK, tags=["User Authentication"])
 async def login(
@@ -1086,7 +1091,7 @@ async def export_users_csv_stream():
     writer = csv.writer(output)
     
     # Header
-    writer.writerow(["id", "email", "display_name", "status", "created_at", "q1", "q2", "q3", "q4", "q5"])
+    writer.writerow(["id", "email", "display_name", "status", "created_at", "gender", "interested_in", "state", "bio", "single_reason", "quiz_answers"])
     yield output.getvalue()
     output.seek(0)
     output.truncate(0)
@@ -1095,7 +1100,7 @@ async def export_users_csv_stream():
     offset = 0
     while True:
         try:
-            res = db.table("users").select("id, email, display_name, status, created_at, quiz_answers")\
+            res = db.table("users").select("id, email, display_name, status, created_at, quiz_answers, gender, interested_in, state, bio, single_reason")\
                 .order("created_at", desc=True)\
                 .range(offset, offset + chunk_size - 1).execute()
         except Exception as e:
@@ -1125,11 +1130,13 @@ async def export_users_csv_stream():
                 _sanitize_csv_field(row["display_name"]),
                 row["status"],
                 created_at_str,
-                _sanitize_csv_field(quiz.get("q1", "")),
-                _sanitize_csv_field(quiz.get("q2", "")),
-                _sanitize_csv_field(quiz.get("q3", "")),
-                _sanitize_csv_field(quiz.get("q4", "")),
-                _sanitize_csv_field(quiz.get("q5", ""))
+                _sanitize_csv_field(row["gender"]),
+                _sanitize_csv_field(", ".join(row["interested_in"] or [])),
+                _sanitize_csv_field(row["state"]),
+                _sanitize_csv_field(row["bio"]),
+                _sanitize_csv_field(row["single_reason"]),
+                # One JSON column keyed by question, since the quiz questions change over time
+                _sanitize_csv_field(json.dumps(quiz, ensure_ascii=False))
             ])
             yield output.getvalue()
             output.seek(0)

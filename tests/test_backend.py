@@ -96,12 +96,17 @@ class TestChatRoomBackend(unittest.TestCase):
         payload = {
             "email": "user@example.com",
             "password": "securepassword123",
+            "gender": "female",
+            "interested_in": ["male", "non_binary"],
+            "state": "Karnataka",
+            "bio": "  I love long walks, filter coffee and terrible puns.  ",
+            "single_reason": "  Moved cities for work and haven't met the right person yet.  ",
             "quiz_answers": {
                 "q1": "spontaneous",
                 "q2": "introvert"
             }
         }
-        
+
         response = self.client.post("/api/signup", json=payload)
         self.assertEqual(response.status_code, 200)
         data = response.json()
@@ -109,6 +114,44 @@ class TestChatRoomBackend(unittest.TestCase):
         self.assertEqual(data["user"]["display_name"], "TestDolphin")
         self.assertEqual(data["user"]["status"], "waiting")
         mock_register.assert_called_once()
+        # Profile answers reach the service as one dict, with free-text whitespace trimmed
+        self.assertEqual(mock_register.call_args.args[3], {
+            "gender": "female",
+            "interested_in": ["male", "non_binary"],
+            "state": "Karnataka",
+            "bio": "I love long walks, filter coffee and terrible puns.",
+            "single_reason": "Moved cities for work and haven't met the right person yet."
+        })
+
+    @patch("app.main.register_user")
+    def test_user_signup_rejects_invalid_profile(self, mock_register):
+        """Verify signup rejects unknown options, empty attraction choices, and text outside the length limits."""
+        valid_payload = {
+            "email": "user@example.com",
+            "password": "securepassword123",
+            "gender": "male",
+            "interested_in": ["female"],
+            "state": "Non-Indian",
+            "bio": "Software engineer who spends weekends hiking.",
+            "single_reason": "Too busy climbing mountains."
+        }
+        invalid_overrides = [
+            {"gender": "robot"},
+            {"interested_in": []},
+            {"interested_in": ["robot"]},
+            {"interested_in": "female"},
+            {"state": "Atlantis"},
+            {"state": None},
+            {"bio": "   too short    "},
+            {"bio": "x" * 501},
+            {"single_reason": "   meh   "},
+            {"single_reason": "x" * 301},
+        ]
+        for override in invalid_overrides:
+            with self.subTest(override=override):
+                response = self.client.post("/api/signup", json={**valid_payload, **override})
+                self.assertEqual(response.status_code, 422)
+        mock_register.assert_not_called()
 
     @patch("app.main.authenticate_user")
     def test_user_login_success(self, mock_auth):

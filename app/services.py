@@ -15,6 +15,7 @@ async def register_user(
     email: str,
     password_plain: str,
     quiz_answers: dict[str, str],
+    profile: dict[str, str | list[str]],
     db: Client
 ) -> dict:
     """Signs up a new user, hashes their password, generates display names/avatars,
@@ -66,6 +67,7 @@ async def register_user(
             "display_name": display_name,
             "avatar_seed": avatar_seed,
             "quiz_answers": quiz_answers,
+            **profile,
             "status": "waiting"
         }).execute()
         
@@ -316,7 +318,7 @@ async def get_admin_users(
     offset = (page - 1) * limit
 
     try:
-        query = db.table("users").select("id, email, display_name, avatar_seed, status, room_id, quiz_answers, created_at", count="exact")
+        query = db.table("users").select("id, email, display_name, avatar_seed, status, room_id, quiz_answers, gender, interested_in, state, bio, single_reason, created_at", count="exact")
 
         if search:
             pattern = _escape_postgrest_value(f"%{search}%")

@@ -11,12 +11,19 @@ create table rooms (
 );
 
 -- Create users table referencing rooms
+-- Profile columns (gender through single_reason) are collected at password signup; they stay
+-- nullable because email-OTP auto-signups skip that form.
 create table users (
   id uuid primary key default gen_random_uuid(),
   email text unique not null,
   display_name text not null,
   avatar_seed text not null,
   quiz_answers jsonb not null default '{}',
+  gender text check (gender in ('male', 'female', 'non_binary')),
+  interested_in text[] check (interested_in <@ array['male', 'female', 'non_binary']),
+  state text,
+  bio text,
+  single_reason text,
   status text not null default 'waiting' check (status in ('waiting', 'matched')),
   room_id uuid references rooms(id) on delete set null,
   created_at timestamptz not null default now()
@@ -53,3 +60,11 @@ create table email_otps (
 
 -- Migration for existing databases created before the "attempts" lockout counter existed:
 -- alter table email_otps add column if not exists attempts integer not null default 0;
+
+-- Migration for existing databases created before signup collected profile details
+-- (safe to re-run: columns that already exist are skipped):
+-- alter table users add column if not exists gender text check (gender in ('male', 'female', 'non_binary'));
+-- alter table users add column if not exists interested_in text[] check (interested_in <@ array['male', 'female', 'non_binary']);
+-- alter table users add column if not exists state text;
+-- alter table users add column if not exists bio text;
+-- alter table users add column if not exists single_reason text;

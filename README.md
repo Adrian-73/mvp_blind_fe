@@ -46,6 +46,11 @@ create table users (
   display_name text not null,
   avatar_seed text not null,
   quiz_answers jsonb not null default '{}',
+  gender text check (gender in ('male', 'female', 'non_binary')),
+  interested_in text[] check (interested_in <@ array['male', 'female', 'non_binary']),
+  state text,
+  bio text,
+  single_reason text,
   status text not null default 'waiting' check (status in ('waiting', 'matched')),
   room_id uuid references rooms(id) on delete set null,
   created_at timestamptz not null default now()
