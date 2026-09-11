@@ -17,3 +17,14 @@ services:
         sync: false
       - key: FRONTEND_URL
         sync: false
+      # Optional: match notification emails
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_PORT
+        sync: false
+      - key: SMTP_USERNAME
+        sync: false
+      - key: SMTP_PASSWORD
+        sync: false
+      - key: SMTP_FROM
+        sync: false

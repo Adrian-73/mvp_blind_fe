@@ -11,6 +11,7 @@ This is a secure, high-performance, real-time private blind-dating chat room app
 4. **WebSocket Messaging**: Real-time message exchange within active rooms with permanent messaging storage.
 5. **Streaming CSV Exports**: High-performance streaming of user records and message logs using server-side cursors to maintain near-zero memory footprint.
 6. **Robust Real-Time Closures**: Automatic client redirection via custom close codes on room deactivation by an admin.
+7. **Match Emails (optional)**: When matching, the admin can email both users their match's codename and a link back to chat. Works with any SMTP provider and stays off until SMTP is configured.
 
 ---
 
@@ -90,8 +91,16 @@ ADMIN_JWT_SECRET=your_admin_jwt_signing_secret_minimum_32_characters
 ADMIN_USERNAME=dating_admin
 ADMIN_PASSWORD_HASH=paste_the_output_of_hash_password.py_here
 FRONTEND_URL=https://private-blind-dating.vercel.app
+# Optional, for match emails
+SMTP_HOST=smtp-relay.brevo.com
+SMTP_PORT=587
+SMTP_USERNAME=your_smtp_login
+SMTP_PASSWORD=your_smtp_password
+SMTP_FROM=Loom <matchmaker@yourdomain.com>
 ```
 *(Generate `ADMIN_PASSWORD_HASH` by running `python hash_password.py` from the project root and pasting the line it prints.)*
+
+**Match emails** are optional: with `SMTP_HOST` empty, the admin panel's email toggle stays disabled. `FRONTEND_URL` must be the public app URL because the emails link to `FRONTEND_URL/waiting`. Render's free tier blocks outbound SMTP ports 25, 465 and 587, so on a free instance use your provider's alternate port (2525 for Brevo or Mailgun, 2587 for Resend). Set `SMTP_USE_SSL=true` if your provider's port expects TLS from the first byte (465 does this automatically).
 
 ---
 
@@ -126,6 +135,7 @@ To deploy onto **Render free tier** using the blueprint `render.yaml` configurat
    - `ADMIN_USERNAME`
    - `ADMIN_PASSWORD_HASH`
    - `FRONTEND_URL`
+   - `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM` (optional, for match emails)
 
 ---
 
@@ -144,7 +154,8 @@ To deploy onto **Render free tier** using the blueprint `render.yaml` configurat
 ### Admin Endpoints
 - **POST** `/api/admin/login`: Verifies admin password and issues custom Admin JWT.
 - **GET** `/api/admin/users`: Searchable and paginated user list.
-- **POST** `/api/admin/match`: Pair two waiting users into an active room and dispatches WebSocket status updates.
+- **POST** `/api/admin/match`: Pair two waiting users into an active room and dispatches WebSocket status updates. Send `"notify_by_email": true` to also email both users; the response's `email_status` is `sent`, `partial`, `failed`, `not_configured` or `skipped`.
+- **GET** `/api/admin/email-config`: Returns `{"enabled": true}` when SMTP is configured, so the admin panel knows whether match emails can be sent.
 - **GET** `/api/admin/rooms`: Lists all active rooms.
 - **POST** `/api/admin/rooms/{room_id}/deactivate`: Closes room, releases users, and cleans up sockets.
 - **GET** `/api/admin/users/export`: High-performance Streaming CSV export of all users.

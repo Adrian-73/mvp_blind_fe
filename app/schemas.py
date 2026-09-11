@@ -127,9 +127,17 @@ class AdminUsersListResponse(BaseModel):
 class MatchRequest(BaseModel):
     user_a_id: UUID
     user_b_id: UUID
+    notify_by_email: bool = False
+
+# How the optional match emails went; "skipped" means the admin didn't ask for them
+EmailStatus = Literal["sent", "partial", "failed", "not_configured", "skipped"]
 
 class MatchResponse(BaseModel):
     room_id: UUID
+    email_status: EmailStatus = "skipped"
+
+class AdminEmailConfigResponse(BaseModel):
+    enabled: bool
 
 class AdminUserBrief(BaseModel):
     id: UUID

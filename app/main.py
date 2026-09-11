@@ -24,7 +24,7 @@ from app.schemas import (
     SendOtpRequest, VerifyOtpRequest,
     StatusResponse, MessagesListResponse, MessageResponse,
     AdminLoginRequest, AdminTokenResponse, AdminUsersListResponse,
-    MatchRequest, MatchResponse, AdminRoomsListResponse
+    MatchRequest, MatchResponse, AdminRoomsListResponse, AdminEmailConfigResponse
 )
 from app.services import (
     register_user, authenticate_user, get_user_status, submit_quiz,
@@ -32,6 +32,7 @@ from app.services import (
     send_email_otp, verify_email_otp
 )
 from app.state import connections
+from app.mailer import is_email_configured
 from supabase import Client
 
 # Lifespan manager for DB connection pool
@@ -1042,8 +1043,15 @@ async def match_waiting_users(
     current_admin: str = Depends(get_current_admin),
     db: Client = Depends(get_db_connection)
 ):
-    """Matches two waiting users into an active chat room (admin only)."""
-    return await match_users(body.user_a_id, body.user_b_id, db)
+    """Matches two waiting users into an active chat room, optionally emailing both of them (admin only)."""
+    return await match_users(body.user_a_id, body.user_b_id, db, notify_by_email=body.notify_by_email)
+
+@app.get("/api/admin/email-config", response_model=AdminEmailConfigResponse, status_code=status.HTTP_200_OK, tags=["Admin Control Panel"])
+async def get_email_config(
+    current_admin: str = Depends(get_current_admin)
+):
+    """Reports whether SMTP is configured, so the admin panel knows if match emails can be sent (admin only)."""
+    return {"enabled": is_email_configured()}
 
 @app.get("/api/admin/rooms", response_model=AdminRoomsListResponse, status_code=status.HTTP_200_OK, tags=["Admin Control Panel"])
 async def get_rooms_list(

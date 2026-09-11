@@ -10,6 +10,7 @@ from app.utils.names import generate_display_name
 from app.utils.avatars import generate_avatar_seed
 from app.auth import hash_password, verify_password, create_user_token
 from app.state import connections
+from app.mailer import send_match_emails
 
 async def register_user(
     email: str,
@@ -354,9 +355,14 @@ async def get_admin_users(
 async def match_users(
     user_a_id: UUID,
     user_b_id: UUID,
-    db: Client
+    db: Client,
+    notify_by_email: bool = False
 ) -> dict:
-    """Matches two waiting users into an active room with simulated transactional safety (admin only)."""
+    """Matches two waiting users into an active room with simulated transactional safety (admin only).
+
+    With notify_by_email, both users are emailed once the match is saved; the returned
+    email_status says how that went ("skipped" when emails weren't requested).
+    """
     if user_a_id == user_b_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -428,19 +434,15 @@ async def match_users(
                 except Exception as rollback_err:
                     print(f"Cleanup rollback failed for room {room_id}: {rollback_err}", file=sys.stderr)
             raise match_err
-        # Simulate Email Match Notifications
-        email_a = user_map[str(user_a_id)]["email"]
-        email_b = user_map[str(user_b_id)]["email"]
-        name_a = user_map[str(user_a_id)]["display_name"]
-        name_b = user_map[str(user_b_id)]["display_name"]
-        
-        print(f"\n{'='*50}\n[MOCK EMAIL] To: {email_a}\nSubject: You have a new match!\n\nYou've been matched with {name_b}. Jump into the chat now!\n{'='*50}\n", file=sys.stderr)
-        print(f"\n{'='*50}\n[MOCK EMAIL] To: {email_b}\nSubject: You have a new match!\n\nYou've been matched with {name_a}. Jump into the chat now!\n{'='*50}\n", file=sys.stderr)
-        
         # Dispatch WS notifications
         await notify_match(room_id, user_a_id, user_map[str(user_b_id)], user_b_id, user_map[str(user_a_id)])
-        
-        return {"room_id": room_id}
+
+        # Emails go last: the match is already saved, and send_match_emails never raises
+        email_status = "skipped"
+        if notify_by_email:
+            email_status = await send_match_emails(user_map[str(user_a_id)], user_map[str(user_b_id)])
+
+        return {"room_id": room_id, "email_status": email_status}
     except HTTPException:
         raise
     except Exception as e:

@@ -1,4 +1,6 @@
+import asyncio
 import os
+import smtplib
 import sys
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -24,6 +26,8 @@ os.environ["ADMIN_PASSWORD_HASH"] = hash_password("test_password")
 
 from fastapi.testclient import TestClient
 from app.main import app as fastapi_app
+from app.mailer import send_match_emails
+from app.services import match_users
 
 class MockAPIResponse:
     def __init__(self, data, count=None):
@@ -260,6 +264,39 @@ class TestChatRoomBackend(unittest.TestCase):
         self.assertEqual(response.json()["total"], 0)
         mock_get_users.assert_called_once()
 
+    @patch("app.main.match_users")
+    def test_admin_match_passes_email_option(self, mock_match):
+        """Verify the match endpoint forwards the admin's email choice and reports how the emails went."""
+        room_id = str(uuid4())
+        mock_match.return_value = {"room_id": room_id, "email_status": "sent"}
+        headers = {"Authorization": f"Bearer {create_admin_token()}"}
+        ids = {"user_a_id": str(uuid4()), "user_b_id": str(uuid4())}
+
+        response = self.client.post("/api/admin/match", headers=headers, json={**ids, "notify_by_email": True})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"room_id": room_id, "email_status": "sent"})
+        self.assertTrue(mock_match.call_args.kwargs["notify_by_email"])
+
+        # Clients that don't send the option keep the old behaviour: no emails
+        mock_match.return_value = {"room_id": room_id}
+        response = self.client.post("/api/admin/match", headers=headers, json=ids)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["email_status"], "skipped")
+        self.assertFalse(mock_match.call_args.kwargs["notify_by_email"])
+
+    def test_admin_email_config(self):
+        """Verify the email config endpoint is admin-only and reflects whether SMTP is set up."""
+        headers = {"Authorization": f"Bearer {create_admin_token()}"}
+        with patch.dict(os.environ, {"SMTP_HOST": "smtp.example.com", "SMTP_FROM": "Loom <matchmaker@example.com>"}):
+            response = self.client.get("/api/admin/email-config", headers=headers)
+            self.assertEqual(response.json(), {"enabled": True})
+        with patch.dict(os.environ, {"SMTP_HOST": "", "SMTP_FROM": ""}):
+            response = self.client.get("/api/admin/email-config", headers=headers)
+            self.assertEqual(response.json(), {"enabled": False})
+
+        user_headers = {"Authorization": f"Bearer {create_user_token(str(uuid4()))}"}
+        self.assertEqual(self.client.get("/api/admin/email-config", headers=user_headers).status_code, 401)
+
     def test_public_metrics_success(self):
         """Verify the unauthenticated public metrics endpoint returns the correct fields."""
         self.mock_db_responses["rooms"] = MockAPIResponse([], count=5)
@@ -271,6 +308,100 @@ class TestChatRoomBackend(unittest.TestCase):
         self.assertIn("connected_users_count", data)
         self.assertTrue(data["db_connected"])
         self.assertEqual(data["active_rooms_count"], 5)
+
+SMTP_ENV = {
+    "SMTP_HOST": "smtp.example.com",
+    "SMTP_PORT": "2525",
+    "SMTP_USERNAME": "loom",
+    "SMTP_PASSWORD": "smtp-secret",
+    "SMTP_FROM": "Loom <matchmaker@example.com>",
+    "SMTP_USE_SSL": "",
+    "FRONTEND_URL": "https://loom.example.com/",
+}
+
+class TestMatchEmails(unittest.TestCase):
+    user_a = {"id": str(uuid4()), "email": "calm.river@example.com", "display_name": "CalmRiver", "avatar_seed": "aaa", "status": "waiting"}
+    user_b = {"id": str(uuid4()), "email": "otter@example.com", "display_name": "MysticOtter", "avatar_seed": "bbb", "status": "waiting"}
+
+    def send(self):
+        return asyncio.run(send_match_emails(self.user_a, self.user_b))
+
+    def test_not_configured_without_smtp_settings(self):
+        """Verify nothing is sent, and the admin is told why, when SMTP isn't set up."""
+        with patch.dict(os.environ, {"SMTP_HOST": "", "SMTP_FROM": ""}), patch("app.mailer.smtplib.SMTP") as mock_smtp:
+            self.assertEqual(self.send(), "not_configured")
+        mock_smtp.assert_not_called()
+
+    @patch.dict(os.environ, SMTP_ENV)
+    @patch("app.mailer.smtplib.SMTP")
+    def test_emails_each_user_about_their_partner(self, mock_smtp):
+        """Verify both users are emailed over one TLS-upgraded, authenticated connection."""
+        self.assertEqual(self.send(), "sent")
+
+        mock_smtp.assert_called_once_with("smtp.example.com", 2525, timeout=15)
+        server = mock_smtp.return_value
+        server.starttls.assert_called_once()
+        server.login.assert_called_once_with("loom", "smtp-secret")
+
+        email_a, email_b = [call.args[0] for call in server.send_message.call_args_list]
+        self.assertEqual(email_a["To"], "calm.river@example.com")
+        self.assertEqual(email_b["To"], "otter@example.com")
+        body_a = email_a.get_body(("plain",)).get_content()
+        self.assertIn("MysticOtter", body_a)
+        self.assertIn("https://loom.example.com/waiting", body_a)
+        self.assertIn("CalmRiver", email_b.get_body(("plain",)).get_content())
+        # Blind dating: neither email reveals the partner's address
+        self.assertNotIn("otter@example.com", email_a.as_string())
+        self.assertNotIn("calm.river@example.com", email_b.as_string())
+
+    @patch.dict(os.environ, SMTP_ENV)
+    @patch("app.mailer.smtplib.SMTP")
+    def test_one_rejected_recipient_is_partial(self, mock_smtp):
+        """Verify a single refused address is reported as a partial send."""
+        mock_smtp.return_value.send_message.side_effect = [
+            None,
+            smtplib.SMTPRecipientsRefused({"otter@example.com": (550, b"No such user")}),
+        ]
+        self.assertEqual(self.send(), "partial")
+
+    @patch.dict(os.environ, SMTP_ENV)
+    @patch("app.mailer.smtplib.SMTP", side_effect=OSError("Connection refused"))
+    def test_unreachable_server_fails_without_raising(self, mock_smtp):
+        """Verify a dead SMTP server is reported as failed instead of raising."""
+        self.assertEqual(self.send(), "failed")
+
+    @patch.dict(os.environ, SMTP_ENV)
+    @patch("app.mailer.smtplib.SMTP")
+    def test_refuses_to_send_password_without_tls(self, mock_smtp):
+        """Verify credentials are never sent over a connection that can't be encrypted."""
+        mock_smtp.return_value.has_extn.return_value = False
+        self.assertEqual(self.send(), "failed")
+        mock_smtp.return_value.login.assert_not_called()
+
+    @patch.dict(os.environ, {**SMTP_ENV, "SMTP_PORT": "465"})
+    @patch("app.mailer.smtplib.SMTP_SSL")
+    def test_port_465_uses_implicit_tls(self, mock_smtp_ssl):
+        """Verify port 465 connects with TLS from the start rather than STARTTLS."""
+        self.assertEqual(self.send(), "sent")
+        mock_smtp_ssl.return_value.starttls.assert_not_called()
+
+    @patch("app.services.send_match_emails", new_callable=AsyncMock, return_value="sent")
+    def test_match_only_emails_when_asked(self, mock_send):
+        """Verify match_users emails the pair only when the admin opts in, after the match is saved."""
+        def match_db():
+            return ChainedMock({
+                "users": MockAPIResponse([self.user_a, self.user_b]),
+                "rooms": MockAPIResponse([{"id": "room-1"}]),
+            })
+        user_a_id, user_b_id = self.user_a["id"], self.user_b["id"]
+
+        result = asyncio.run(match_users(user_a_id, user_b_id, match_db()))
+        self.assertEqual(result, {"room_id": "room-1", "email_status": "skipped"})
+        mock_send.assert_not_called()
+
+        result = asyncio.run(match_users(user_a_id, user_b_id, match_db(), notify_by_email=True))
+        self.assertEqual(result, {"room_id": "room-1", "email_status": "sent"})
+        mock_send.assert_awaited_once_with(self.user_a, self.user_b)
 
 if __name__ == "__main__":
     unittest.main()
