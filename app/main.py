@@ -14,6 +14,7 @@ from fastapi import FastAPI, Depends, HTTPException, status, Query, WebSocket, W
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 
 from app.database import init_db, close_db, get_db_connection
@@ -1364,8 +1365,21 @@ async def websocket_room_handler(websocket: WebSocket, room_id: UUID):
 # --- Frontend (Svelte build copied into app/static by .githooks/pre-push) ---
 # Mounted last so every API, docs and WebSocket route above takes precedence.
 
+class SPAStaticFiles(StaticFiles):
+    """Serves index.html for unknown page paths (e.g. /admin) so main.js can map them to hash routes."""
+
+    async def get_response(self, path: str, scope):
+        try:
+            return await super().get_response(path, scope)
+        except StarletteHTTPException as exc:
+            # Missing files (anything with an extension) and unknown /api paths keep a real 404
+            is_api_path = path.split(os.sep, 1)[0] == "api"
+            if exc.status_code != 404 or os.path.splitext(path)[1] or is_api_path:
+                raise
+            return await super().get_response("index.html", scope)
+
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 if os.path.isdir(STATIC_DIR):
-    app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="frontend")
+    app.mount("/", SPAStaticFiles(directory=STATIC_DIR, html=True), name="frontend")
 else:
     print(f"Frontend build not found at {STATIC_DIR}; serving API only", file=sys.stderr)
