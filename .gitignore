@@ -19,3 +19,4 @@ venv.bak/
 .vscode/
 *.swp
 *.swo
+hash_password.py

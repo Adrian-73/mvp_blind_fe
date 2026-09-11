@@ -83,10 +83,10 @@ DATABASE_URL=postgresql://postgres.yourproject:yourpassword@aws-0-us-east-1.pool
 JWT_SECRET=your_jwt_signing_secret_for_users_minimum_32_characters
 ADMIN_JWT_SECRET=your_admin_jwt_signing_secret_minimum_32_characters
 ADMIN_USERNAME=dating_admin
-ADMIN_PASSWORD_HASH=$2b$12$Z0bOa3wG36DvxP7rWdK5fO/4R8P.Ww262zLwZ3Xf8h1o.3qK4kSXe
+ADMIN_PASSWORD_HASH=paste_the_output_of_hash_password.py_here
 FRONTEND_URL=https://private-blind-dating.vercel.app
 ```
-*(The hash above is a bcrypt hash for the password `SecretAdminPassword123`)*
+*(Generate `ADMIN_PASSWORD_HASH` by running `python hash_password.py` from the project root and pasting the line it prints.)*
 
 ---
 
