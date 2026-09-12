@@ -34,7 +34,7 @@ from app.schemas import (
 from app.services import (
     register_user, authenticate_user, get_user_status, submit_quiz,
     get_room_messages, get_admin_users, match_users, get_admin_rooms, deactivate_room,
-    send_email_otp, verify_email_otp
+    send_email_otp, check_email_otp, delete_email_otp, verify_email_otp
 )
 from app.state import connections
 from app.mailer import is_email_configured
@@ -918,8 +918,11 @@ async def signup(
     response: Response,
     db: Client = Depends(get_db_connection)
 ):
-    """Signs up a new user, logs them in with a session cookie and returns their profile."""
+    """Signs up a new user once the code emailed by /api/auth/send-otp checks out, logs them in with a session cookie and returns their profile."""
+    await check_email_otp(body.email, body.otp_code, db)
     user = await register_user(body.email, body.password, body.quiz_answers, body.profile_fields(), db)
+    # The account exists now, so the code must not work again
+    delete_email_otp(body.email, db)
     start_session(db, USER_SESSION, request, response, user_id=user["id"])
     return {"user": user}
 
@@ -940,7 +943,7 @@ async def send_otp(
     body: SendOtpRequest,
     db: Client = Depends(get_db_connection)
 ):
-    """Generates an email OTP, stores it with a 10-minute expiry, and triggers an email simulation."""
+    """Emails a 6-digit code, valid for 10 minutes, that /api/signup requires. Without SMTP configured it is only printed to the server log."""
     return await send_email_otp(body.email, db)
 
 @app.post("/api/auth/verify-otp", response_model=AuthResponse, status_code=status.HTTP_200_OK, tags=["User Authentication"])
@@ -950,7 +953,7 @@ async def verify_otp(
     response: Response,
     db: Client = Depends(get_db_connection)
 ):
-    """Verifies the provided OTP against the database and logs the user in (or auto-registers them)."""
+    """Logs an existing user in with an emailed code. Unknown emails get a 404: new accounts go through /api/signup."""
     user = await verify_email_otp(body.email, body.otp_code, db)
     start_session(db, USER_SESSION, request, response, user_id=user["id"])
     return {"user": user}

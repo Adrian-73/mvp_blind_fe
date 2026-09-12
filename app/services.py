@@ -1,6 +1,7 @@
 import sys
 import json
 import random
+import secrets
 import string
 from datetime import datetime, timezone, timedelta
 from uuid import UUID
@@ -10,7 +11,7 @@ from app.utils.names import generate_display_name
 from app.utils.avatars import generate_avatar_seed
 from app.auth import hash_password, verify_password
 from app.state import connections
-from app.mailer import send_match_emails
+from app.mailer import is_email_configured, send_match_emails, send_otp_email
 
 async def register_user(
     email: str,
@@ -318,7 +319,8 @@ async def get_admin_users(
         if status_filter:
             query = query.eq("status", status_filter)
 
-        res = query.order("created_at", desc=True).range(offset, offset + limit - 1).execute()
+        # Waiting users first ("waiting" sorts after "matched", hence desc), newest first within each group
+        res = query.order("status", desc=True).order("created_at", desc=True).range(offset, offset + limit - 1).execute()
         
         users = []
         for row in res.data:
@@ -561,115 +563,118 @@ async def deactivate_room(
             detail="Database error during deactivation"
         )
 
-async def send_email_otp(email: str, db: Client) -> dict:
-    """Generates a 6-digit OTP, stores it with expiry, and simulates sending an email."""
-    # Generate 6-digit code
-    otp_code = ''.join(random.choices(string.digits, k=6))
+OTP_TTL = timedelta(minutes=10)
+# How long an address waits before it can be sent another code, so nobody can flood an inbox or burn the SMTP quota
+OTP_RESEND_COOLDOWN = timedelta(seconds=60)
+MAX_OTP_ATTEMPTS = 5
 
-    # 10 minutes expiry
-    expires_at = (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()
+async def send_email_otp(email: str, db: Client) -> dict:
+    """Generates a 6-digit OTP, stores it with a 10-minute expiry and emails it.
+
+    Without SMTP configured (local development) the code is printed to the server log instead.
+    """
+    now = datetime.now(timezone.utc)
+    otp_code = ''.join(secrets.choice(string.digits) for _ in range(6))
 
     try:
+        res = db.table("email_otps").select("expires_at").eq("email", email).execute()
+        if res.data:
+            sent_at = datetime.fromisoformat(res.data[0]["expires_at"].replace("Z", "+00:00")) - OTP_TTL
+            if now - sent_at < OTP_RESEND_COOLDOWN:
+                raise HTTPException(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    detail="A code was just sent. Wait a minute before asking for another."
+                )
+
         # Requesting a fresh OTP resets the failed-attempt counter for a clean slate.
         db.table("email_otps").upsert({
             "email": email,
             "otp_code": otp_code,
-            "expires_at": expires_at,
+            "expires_at": (now + OTP_TTL).isoformat(),
             "attempts": 0
         }).execute()
-        
-        # Simulate Email Delivery securely to the console
-        print(f"\n{'='*50}\n[MOCK EMAIL] To: {email}\nSubject: Your Login Code\n\nYour one-time password is: {otp_code}\nIt expires in 10 minutes.\n{'='*50}\n", file=sys.stderr)
-        
-        return {"status": "success", "message": "OTP sent successfully"}
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"Error sending OTP for {email}: {e}", file=sys.stderr)
+        print(f"Error storing OTP for {email}: {e}", file=sys.stderr)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to generate OTP"
         )
 
-MAX_OTP_ATTEMPTS = 5
+    if not is_email_configured():
+        print(f"\n{'='*50}\n[MOCK EMAIL] SMTP is not configured, so this code was only logged\nTo: {email}\n\nYour one-time password is: {otp_code}\nIt expires in 10 minutes.\n{'='*50}\n", file=sys.stderr)
+    elif not await send_otp_email(email, otp_code, int(OTP_TTL.total_seconds()) // 60):
+        # Nothing reached their inbox, so drop the code and let them ask again right away
+        delete_email_otp(email, db)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Couldn't email your code. Check the address and try again."
+        )
 
-async def verify_email_otp(email: str, otp_code: str, db: Client) -> dict:
-    """Verifies the OTP. If valid, acts as login (or auto-signup if user doesn't exist)."""
+    return {"status": "success", "message": "OTP sent successfully"}
+
+def delete_email_otp(email: str, db: Client) -> None:
+    """Removes an address's code. If the delete fails, the code just expires on its own."""
     try:
-        # Check OTP
+        db.table("email_otps").delete().eq("email", email).execute()
+    except Exception as e:
+        print(f"Error deleting OTP for {email}: {e}", file=sys.stderr)
+
+async def check_email_otp(email: str, otp_code: str, db: Client) -> None:
+    """Raises unless otp_code is the address's live code. Wrong guesses count toward MAX_OTP_ATTEMPTS.
+
+    A correct code is left in place; call delete_email_otp once it has done its job.
+    """
+    try:
         res = db.table("email_otps").select("*").eq("email", email).execute()
         if not res.data:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired OTP")
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="That code is wrong or expired.")
 
         record = res.data[0]
 
         expires_at = datetime.fromisoformat(record["expires_at"].replace("Z", "+00:00"))
         if datetime.now(timezone.utc) > expires_at:
-            # Delete expired record
-            db.table("email_otps").delete().eq("email", email).execute()
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired OTP")
+            delete_email_otp(email, db)
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="That code is wrong or expired.")
 
         attempts = record.get("attempts") or 0
         if attempts >= MAX_OTP_ATTEMPTS:
             # Too many failed guesses: burn the code so it can't be brute-forced further.
             # The user must request a fresh OTP to try again.
-            db.table("email_otps").delete().eq("email", email).execute()
-            raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Too many attempts. Please request a new code.")
+            delete_email_otp(email, db)
+            raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Too many wrong codes. Get a new one.")
 
-        if record["otp_code"] != otp_code:
+        if not secrets.compare_digest(record["otp_code"], otp_code):
             # Record the failed attempt so repeated guesses eventually get locked out.
             db.table("email_otps").update({"attempts": attempts + 1}).eq("email", email).execute()
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired OTP")
-
-        # OTP is valid, delete it to prevent reuse
-        db.table("email_otps").delete().eq("email", email).execute()
-        
-        # Check if user exists
-        user_res = db.table("users").select("*").eq("email", email).execute()
-        if user_res.data:
-            # User exists, proceed with login
-            user_row = user_res.data[0]
-            return {
-                "id": user_row["id"],
-                "display_name": user_row["display_name"],
-                "avatar_seed": user_row["avatar_seed"],
-                "status": user_row["status"]
-            }
-        else:
-            # Auto-signup
-            display_name = generate_display_name()
-            for _ in range(5):
-                name_res = db.table("users").select("id").eq("display_name", display_name).execute()
-                if not name_res.data:
-                    break
-                display_name = generate_display_name()
-            else:
-                display_name = f"{display_name}{random.randint(10, 99)}"
-                
-            avatar_seed = generate_avatar_seed()
-            
-            insert_res = db.table("users").insert({
-                "email": email,
-                "display_name": display_name,
-                "avatar_seed": avatar_seed,
-                "quiz_answers": {},
-                "status": "waiting"
-            }).execute()
-            
-            if not insert_res.data:
-                raise Exception("Failed to insert user profile row")
-                
-            new_user = insert_res.data[0]
-            return {
-                "id": new_user["id"],
-                "display_name": new_user["display_name"],
-                "avatar_seed": new_user["avatar_seed"],
-                "status": new_user["status"]
-            }
-            
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="That code is wrong or expired.")
     except HTTPException:
         raise
+    except Exception as e:
+        print(f"Error checking OTP for {email}: {e}", file=sys.stderr)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Couldn't check your code"
+        )
+
+async def verify_email_otp(email: str, otp_code: str, db: Client) -> dict:
+    """Logs an existing user in with an emailed OTP.
+
+    It never creates accounts: new users sign up through register_user, which collects the profile and checks their age.
+    """
+    await check_email_otp(email, otp_code, db)
+    try:
+        res = db.table("users").select("id, display_name, avatar_seed, status").eq("email", email).execute()
     except Exception as e:
         print(f"Error verifying OTP for {email}: {e}", file=sys.stderr)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Authentication failed"
         )
+    if not res.data:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No account uses that email. Sign up first.")
+
+    # The code worked, so it must not work again
+    delete_email_otp(email, db)
+    return res.data[0]

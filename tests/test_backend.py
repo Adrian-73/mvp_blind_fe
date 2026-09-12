@@ -24,12 +24,13 @@ from app.auth import hash_password
 # Pre-generate hashed password dynamically to prevent hash mismatch
 os.environ["ADMIN_PASSWORD_HASH"] = hash_password("test_password")
 
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 from app.main import app as fastapi_app
 from app.mailer import send_match_emails
 from app.schemas import age_from_date_of_birth
-from app.services import match_users
+from app.services import OTP_TTL, match_users, send_email_otp
 from app.sessions import ADMIN_SESSION, USER_SESSION, admin_fingerprint, find_session, hash_token
 from app.state import connections
 
@@ -85,6 +86,28 @@ USER_ROW = {
 }
 PUBLIC_USER = {key: USER_ROW[key] for key in ("id", "display_name", "avatar_seed", "status")}
 LOGIN = {"email": "user@example.com", "password": "securepassword123"}
+SIGNUP = {
+    "email": "user@example.com",
+    "password": "securepassword123",
+    "otp_code": "123456",
+    "date_of_birth": "1995-06-30",
+    "gender": "male",
+    "interested_in": ["female"],
+    "state": "Non-Indian",
+    "bio": "Software engineer who spends weekends hiking.",
+    "single_reason": "Too busy climbing mountains."
+}
+
+def otp_row(code="123456", **overrides):
+    """A live email_otps row for user@example.com, as check_email_otp reads it."""
+    row = {
+        "email": "user@example.com",
+        "otp_code": code,
+        "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(),
+        "attempts": 0
+    }
+    row.update(overrides)
+    return row
 
 def session_row(user=None, admin=False, **overrides):
     """A live sessions row as find_session reads it: user sessions embed their users row, admin ones carry the fingerprint."""
@@ -149,12 +172,14 @@ class TestChatRoomBackend(ApiTestCase):
 
     @patch("app.main.register_user")
     def test_user_signup_success(self, mock_register):
-        """Verify signup handles the Pydantic request shape, returns the profile and logs the user in."""
+        """Verify signup handles the Pydantic request shape, returns the profile, logs the user in and burns the emailed code."""
         mock_register.return_value = PUBLIC_USER
+        self.mock_db_responses["email_otps"] = MockAPIResponse([otp_row("123456")])
 
         payload = {
             "email": "user@example.com",
             "password": "securepassword123",
+            "otp_code": " 123456 ",
             "gender": "female",
             "interested_in": ["male", "non_binary"],
             "date_of_birth": "1998-04-12",
@@ -175,6 +200,7 @@ class TestChatRoomBackend(ApiTestCase):
         self.assertEqual(data["user"]["status"], "waiting")
         self.assertIn(USER_SESSION.cookie_name, response.cookies)
         mock_register.assert_called_once()
+        self.assertTrue(self.mock_db.ran("email_otps", ("delete", ())))
         # Profile answers reach the service as one dict, with free-text whitespace trimmed
         self.assertEqual(mock_register.call_args.args[3], {
             "gender": "female",
@@ -187,18 +213,8 @@ class TestChatRoomBackend(ApiTestCase):
 
     @patch("app.main.register_user")
     def test_user_signup_rejects_invalid_profile(self, mock_register):
-        """Verify signup rejects unknown options, empty attraction choices, impossible or under-18 birthdays, and text outside the length limits."""
+        """Verify signup rejects unknown options, empty attraction choices, impossible or under-18 birthdays, text outside the length limits, and a missing or malformed code."""
         today = datetime.now(timezone.utc).date()
-        valid_payload = {
-            "email": "user@example.com",
-            "password": "securepassword123",
-            "date_of_birth": "1995-06-30",
-            "gender": "male",
-            "interested_in": ["female"],
-            "state": "Non-Indian",
-            "bio": "Software engineer who spends weekends hiking.",
-            "single_reason": "Too busy climbing mountains."
-        }
         invalid_overrides = [
             {"date_of_birth": (today - timedelta(days=365 * 17)).isoformat()},
             {"date_of_birth": (today + timedelta(days=1)).isoformat()},
@@ -214,12 +230,32 @@ class TestChatRoomBackend(ApiTestCase):
             {"bio": "x" * 501},
             {"single_reason": "   meh   "},
             {"single_reason": "x" * 301},
+            {"otp_code": None},
+            {"otp_code": "12345"},
+            {"otp_code": "12345a"},
+            {"otp_code": "١٢٣٤٥٦"},
         ]
         for override in invalid_overrides:
             with self.subTest(override=override):
-                response = self.client.post("/api/signup", json={**valid_payload, **override})
+                response = self.client.post("/api/signup", json={**SIGNUP, **override})
                 self.assertEqual(response.status_code, 422)
         mock_register.assert_not_called()
+
+    @patch("app.main.register_user")
+    def test_user_signup_refuses_a_wrong_code(self, mock_register):
+        """Verify no account is created without the emailed code, and the wrong guess counts toward the lockout."""
+        self.mock_db_responses["email_otps"] = MockAPIResponse([otp_row("654321")])
+        response = self.client.post("/api/signup", json=SIGNUP)
+        self.assertEqual(response.status_code, 400)
+        mock_register.assert_not_called()
+        self.assertEqual(self.mock_db.written("email_otps", "update"), [{"attempts": 1}])
+
+    def test_otp_login_does_not_create_accounts(self):
+        """Verify an emailed code only logs existing users in; new accounts need the full signup and its age check."""
+        self.mock_db_responses["email_otps"] = MockAPIResponse([otp_row("123456")])
+        response = self.client.post("/api/auth/verify-otp", json={"email": "user@example.com", "otp_code": "123456"})
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(self.mock_db.written("users", "insert"), [])
 
     @patch("app.main.get_admin_users")
     def test_admin_users_include_age(self, mock_get_users):
@@ -643,6 +679,57 @@ class TestMatchEmails(unittest.TestCase):
         result = asyncio.run(match_users(user_a_id, user_b_id, match_db(), notify_by_email=True))
         self.assertEqual(result, {"room_id": "room-1", "email_status": "sent"})
         mock_send.assert_awaited_once_with(self.user_a, self.user_b)
+
+class TestSignupCodeEmails(unittest.TestCase):
+    email = "new.user@example.com"
+
+    def send(self, db):
+        return asyncio.run(send_email_otp(self.email, db))
+
+    @patch.dict(os.environ, SMTP_ENV)
+    @patch("app.mailer.smtplib.SMTP")
+    def test_emails_the_code_it_stored(self, mock_smtp):
+        """Verify the code saved for the address is the one emailed to it."""
+        db = ChainedMock()
+        self.send(db)
+
+        [stored] = db.written("email_otps", "upsert")
+        self.assertRegex(stored["otp_code"], r"^[0-9]{6}$")
+        [message] = [call.args[0] for call in mock_smtp.return_value.send_message.call_args_list]
+        self.assertEqual(message["To"], self.email)
+        self.assertIn(stored["otp_code"], message["Subject"])
+        self.assertIn(stored["otp_code"], message.get_body(("plain",)).get_content())
+
+    @patch.dict(os.environ, {"SMTP_HOST": "", "SMTP_FROM": ""})
+    @patch("app.mailer.smtplib.SMTP")
+    def test_without_smtp_the_code_is_only_logged(self, mock_smtp):
+        """Verify local development without SMTP still hands out codes, through the server log."""
+        db = ChainedMock()
+        self.assertEqual(self.send(db)["status"], "success")
+        self.assertEqual(len(db.written("email_otps", "upsert")), 1)
+        mock_smtp.assert_not_called()
+
+    @patch.dict(os.environ, SMTP_ENV)
+    @patch("app.mailer.smtplib.SMTP", side_effect=OSError("Connection refused"))
+    def test_undelivered_code_is_an_error(self, mock_smtp):
+        """Verify the user hears when their code never left, and the code is dropped so they can ask again straight away."""
+        db = ChainedMock()
+        with self.assertRaises(HTTPException) as caught:
+            self.send(db)
+        self.assertEqual(caught.exception.status_code, 502)
+        self.assertTrue(db.ran("email_otps", ("delete", ())))
+
+    @patch.dict(os.environ, SMTP_ENV)
+    @patch("app.mailer.smtplib.SMTP")
+    def test_codes_cannot_be_sent_back_to_back(self, mock_smtp):
+        """Verify an address that was just sent a code has to wait before getting another."""
+        just_sent = datetime.now(timezone.utc) + OTP_TTL
+        db = ChainedMock({"email_otps": MockAPIResponse([{"expires_at": just_sent.isoformat()}])})
+        with self.assertRaises(HTTPException) as caught:
+            self.send(db)
+        self.assertEqual(caught.exception.status_code, 429)
+        self.assertEqual(db.written("email_otps", "upsert"), [])
+        mock_smtp.assert_not_called()
 
 if __name__ == "__main__":
     unittest.main()

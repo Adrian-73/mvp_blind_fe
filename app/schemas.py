@@ -38,9 +38,13 @@ def age_from_date_of_birth(date_of_birth: date | str | None, today: date | None 
     had_birthday_this_year = (today.month, today.day) >= (date_of_birth.month, date_of_birth.day)
     return today.year - date_of_birth.year - (0 if had_birthday_this_year else 1)
 
+# The code emailed by /api/auth/send-otp. Spelled [0-9] because \d would also accept non-ASCII digits.
+OtpCode = Annotated[str, StringConstraints(strip_whitespace=True, pattern=r"^[0-9]{6}$")]
+
 class SignupRequest(BaseModel):
     email: EmailStr
     password: str = Field(..., min_length=6, max_length=128)
+    otp_code: OtpCode
     quiz_answers: dict[str, str] = Field(default_factory=dict)
     date_of_birth: date
     gender: Gender
@@ -65,7 +69,7 @@ class SignupRequest(BaseModel):
 
     def profile_fields(self) -> dict[str, Any]:
         """Profile answers, each stored in its own column on the users row. JSON mode turns the date into an ISO string."""
-        return self.model_dump(mode="json", exclude={"email", "password", "quiz_answers"})
+        return self.model_dump(mode="json", exclude={"email", "password", "otp_code", "quiz_answers"})
 
 class LoginRequest(BaseModel):
     email: EmailStr
@@ -76,7 +80,7 @@ class SendOtpRequest(BaseModel):
 
 class VerifyOtpRequest(BaseModel):
     email: EmailStr
-    otp_code: str = Field(..., min_length=6, max_length=6)
+    otp_code: OtpCode
 
 class UserResponse(BaseModel):
     id: UUID

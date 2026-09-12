@@ -1,4 +1,4 @@
-"""Match notification emails, sent over SMTP using only the standard library.
+"""Emails sent over SMTP using only the standard library: sign-up codes and match notifications.
 
 Any provider with an SMTP relay works (Brevo, Resend, Mailgun, SES, a Gmail app
 password...). Email counts as switched off until SMTP_HOST and SMTP_FROM are set.
@@ -58,6 +58,44 @@ def is_email_configured() -> bool:
     return get_smtp_config() is not None
 
 
+def _card_html(content: str, footer: str) -> str:
+    """Wraps an email's content in the app's look: a white, ink-bordered card on cream, with small print below it."""
+    return f"""\
+<!doctype html>
+<html>
+  <body style="margin:0;padding:0;background:#FFF5EC;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#FFF5EC;padding:32px 16px;">
+      <tr>
+        <td align="center">
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:480px;background:#FFFFFF;border:3px solid #1A1423;border-radius:20px;font-family:'Helvetica Neue',Helvetica,Arial,sans-serif;color:#1A1423;">
+            <tr>
+              <td style="padding:32px 28px;text-align:left;">
+{content}
+              </td>
+            </tr>
+          </table>
+          <p style="max-width:480px;margin:16px auto 0;font-family:Arial,sans-serif;font-size:12px;line-height:1.5;color:#5C5466;">{footer}</p>
+        </td>
+      </tr>
+    </table>
+  </body>
+</html>
+"""
+
+
+def _new_email(config: SmtpConfig, to_address: str, subject: str, text: str, html: str) -> EmailMessage:
+    message = EmailMessage()
+    message["Subject"] = subject
+    message["From"] = config.sender
+    message["To"] = to_address
+    message["Date"] = formatdate(usegmt=True)
+    # Passing the sender's domain avoids make_msgid's hostname lookup, which can stall
+    message["Message-ID"] = make_msgid(domain=parseaddr(config.sender)[1].rpartition("@")[2] or None)
+    message.set_content(text)
+    message.add_alternative(html, subtype="html")
+    return message
+
+
 def build_match_email(config: SmtpConfig, to_address: str, display_name: str, partner_display_name: str) -> EmailMessage:
     """Builds the "you've been matched" email in the app's matchmaker voice.
 
@@ -79,50 +117,43 @@ def build_match_email(config: SmtpConfig, to_address: str, display_name: str, pa
     name = escape(display_name)
     partner = escape(partner_display_name)
     url = escape(chat_url, quote=True)
-    html = f"""\
-<!doctype html>
-<html>
-  <body style="margin:0;padding:0;background:#FFF5EC;">
-    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#FFF5EC;padding:32px 16px;">
-      <tr>
-        <td align="center">
-          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:480px;background:#FFFFFF;border:3px solid #1A1423;border-radius:20px;font-family:'Helvetica Neue',Helvetica,Arial,sans-serif;color:#1A1423;">
-            <tr>
-              <td style="padding:32px 28px;text-align:left;">
+    content = f"""\
                 <p style="margin:0 0 8px;font-size:12px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:#D81B55;">Loom &middot; It's a match</p>
                 <h1 style="margin:0 0 20px;font-size:32px;line-height:1.1;font-weight:800;">Stop crying.<br>You've got a match.</h1>
                 <p style="margin:0 0 16px;font-size:16px;line-height:1.5;">Hi {name},</p>
                 <p style="margin:0 0 16px;font-size:16px;line-height:1.5;">I did it. I found someone who might actually be able to handle you.</p>
                 <p style="margin:0 0 24px;font-size:16px;line-height:1.5;">Your match goes by <strong style="background:#FFD23F;padding:0 4px;">{partner}</strong>. That's all you get for now. It's blind dating, remember?</p>
                 <a href="{url}" style="display:inline-block;padding:14px 24px;background:#FF3D71;color:#1A1423;border:2px solid #1A1423;border-radius:12px;font-size:16px;font-weight:700;text-decoration:none;">Go say hi &rarr;</a>
-                <p style="margin:24px 0 0;font-size:16px;line-height:1.5;">Don't leave them on seen.<br>The Matchmaker</p>
-              </td>
-            </tr>
-          </table>
-          <p style="max-width:480px;margin:16px auto 0;font-family:Arial,sans-serif;font-size:12px;line-height:1.5;color:#5C5466;">You're getting this because you signed up for Loom and I just matched you with someone.</p>
-        </td>
-      </tr>
-    </table>
-  </body>
-</html>
-"""
+                <p style="margin:24px 0 0;font-size:16px;line-height:1.5;">Don't leave them on seen.<br>The Matchmaker</p>"""
+    html = _card_html(content, "You're getting this because you signed up for Loom and I just matched you with someone.")
+    return _new_email(config, to_address, MATCH_EMAIL_SUBJECT, text, html)
 
-    message = EmailMessage()
-    message["Subject"] = MATCH_EMAIL_SUBJECT
-    message["From"] = config.sender
-    message["To"] = to_address
-    message["Date"] = formatdate(usegmt=True)
-    # Passing the sender's domain avoids make_msgid's hostname lookup, which can stall
-    message["Message-ID"] = make_msgid(domain=parseaddr(config.sender)[1].rpartition("@")[2] or None)
-    message.set_content(text)
-    message.add_alternative(html, subtype="html")
-    return message
+
+def build_otp_email(config: SmtpConfig, to_address: str, otp_code: str, expires_in_minutes: int) -> EmailMessage:
+    """Builds the sign-up code email. The code also goes in the subject so it shows in inbox previews."""
+    text = (
+        f"Your Loom code is {otp_code}\n\n"
+        "Type it into the sign-up page and I'll get to work on your love life.\n"
+        f"It expires in {expires_in_minutes} minutes, so no dawdling.\n\n"
+        "The Matchmaker\n\n"
+        "Didn't try to sign up for Loom? Someone typed your email by mistake. Ignore this and nothing happens.\n"
+    )
+
+    code = escape(otp_code)
+    content = f"""\
+                <p style="margin:0 0 8px;font-size:12px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:#D81B55;">Loom &middot; Sign-up code</p>
+                <h1 style="margin:0 0 20px;font-size:32px;line-height:1.1;font-weight:800;">Prove you're real.</h1>
+                <p style="margin:0 0 16px;font-size:16px;line-height:1.5;">Type this into the sign-up page and I'll get to work on your love life.</p>
+                <p style="margin:0 0 24px;"><span style="display:inline-block;padding:12px 20px;background:#FFD23F;border:2px solid #1A1423;border-radius:12px;font-family:'Courier New',Courier,monospace;font-size:32px;font-weight:700;letter-spacing:8px;">{code}</span></p>
+                <p style="margin:0;font-size:16px;line-height:1.5;">It expires in {expires_in_minutes} minutes, so no dawdling.<br>The Matchmaker</p>"""
+    html = _card_html(content, "Didn't try to sign up for Loom? Someone typed your email by mistake. Ignore this and nothing happens.")
+    return _new_email(config, to_address, f"{otp_code} is your Loom code", text, html)
 
 
 def _deliver(config: SmtpConfig, messages: dict[str, EmailMessage]) -> int:
     """Sends every message over one SMTP connection and returns how many were accepted.
 
-    messages is keyed by user id, which is what gets logged so addresses stay out of the logs.
+    messages is keyed by a label for the logs, like "Match email to user <id>", so addresses stay out of them.
     """
     tls = ssl.create_default_context()
     if config.use_ssl:
@@ -142,12 +173,12 @@ def _deliver(config: SmtpConfig, messages: dict[str, EmailMessage]) -> int:
             server.login(config.username, config.password or "")
 
         sent = 0
-        for user_id, message in messages.items():
+        for label, message in messages.items():
             try:
                 server.send_message(message)
                 sent += 1
             except (smtplib.SMTPException, OSError) as e:
-                print(f"Match email to user {user_id} was not delivered: {e}", file=sys.stderr)
+                print(f"{label} was not delivered: {e}", file=sys.stderr)
         return sent
 
 
@@ -164,8 +195,8 @@ async def send_match_emails(user_a: dict, user_b: dict) -> str:
 
     try:
         messages = {
-            user_a["id"]: build_match_email(config, user_a["email"], user_a["display_name"], user_b["display_name"]),
-            user_b["id"]: build_match_email(config, user_b["email"], user_b["display_name"], user_a["display_name"]),
+            f"Match email to user {user_a['id']}": build_match_email(config, user_a["email"], user_a["display_name"], user_b["display_name"]),
+            f"Match email to user {user_b['id']}": build_match_email(config, user_b["email"], user_b["display_name"], user_a["display_name"]),
         }
         # smtplib blocks, so run it off the event loop that also serves the chat WebSockets
         sent = await asyncio.to_thread(_deliver, config, messages)
@@ -176,3 +207,18 @@ async def send_match_emails(user_a: dict, user_b: dict) -> str:
     if sent == len(messages):
         return "sent"
     return "partial" if sent else "failed"
+
+
+async def send_otp_email(to_address: str, otp_code: str, expires_in_minutes: int) -> bool:
+    """Emails a sign-up code and never raises. False means it wasn't delivered, or SMTP isn't set up."""
+    config = get_smtp_config()
+    if config is None:
+        return False
+
+    try:
+        message = build_otp_email(config, to_address, otp_code, expires_in_minutes)
+        sent = await asyncio.to_thread(_deliver, config, {"Sign-up code email": message})
+    except Exception as e:
+        print(f"Sending a sign-up code email failed: {e}", file=sys.stderr)
+        return False
+    return sent == 1
