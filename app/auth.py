@@ -1,19 +1,18 @@
 import os
 import sys
-from datetime import datetime, timedelta, timezone
-from jose import JWTError, jwt
 from passlib.context import CryptContext
 from fastapi import Depends, HTTPException, status
-from fastapi.security import OAuth2PasswordBearer
+from fastapi.security import APIKeyCookie
 from app.database import get_db_connection
+from app.sessions import ADMIN_SESSION, USER_SESSION, SessionPolicy, find_session
 from supabase import Client
 
 # Password hashing configuration
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-# OAuth2 schemes
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login", scheme_name="UserSecurity")
-admin_oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/admin/login", scheme_name="AdminSecurity")
+# Session cookies, set by the login routes. Declared as security schemes so /docs marks the routes that need them.
+user_session_cookie = APIKeyCookie(name=USER_SESSION.cookie_name, scheme_name="UserSession", auto_error=False)
+admin_session_cookie = APIKeyCookie(name=ADMIN_SESSION.cookie_name, scheme_name="AdminSession", auto_error=False)
 
 def hash_password(password: str) -> str:
     """Hashes a plain password using bcrypt."""
@@ -23,117 +22,42 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
     """Verifies a plain password against its bcrypt hash."""
     return pwd_context.verify(plain_password, hashed_password)
 
-# JWT generation and validation helper functions
-
-def create_user_token(user_id: str) -> str:
-    """Generates a custom User JWT token (HS256) valid for 30 days."""
-    secret = os.getenv("JWT_SECRET")
-    if not secret:
-        print("JWT_SECRET is missing from environment variables", file=sys.stderr)
-        raise ValueError("JWT_SECRET is not set")
-    
-    now = datetime.now(timezone.utc)
-    expire = now + timedelta(days=30)
-    payload = {
-        "sub": user_id,
-        "role": "user",
-        "exp": int(expire.timestamp())
-    }
-    return jwt.encode(payload, secret, algorithm="HS256")
-
-def verify_user_token(token: str) -> str:
-    """Verifies a User JWT token and returns the user UUID as a string."""
-    secret = os.getenv("JWT_SECRET")
-    if not secret:
-        print("JWT_SECRET is missing from environment variables", file=sys.stderr)
-        raise ValueError("JWT_SECRET is not set")
-    
+def _require_session(db: Client, policy: SessionPolicy, token: str | None) -> dict:
     try:
-        payload = jwt.decode(token, secret, algorithms=["HS256"])
-        role = payload.get("role")
-        user_id = payload.get("sub")
-        if role != "user" or not user_id:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid token claims"
-            )
-        return user_id
-    except JWTError as e:
-        print(f"User JWT verification failed: {e}", file=sys.stderr)
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Could not validate credentials"
-        )
-
-def create_admin_token() -> str:
-    """Generates a custom Admin JWT token (HS256) valid for 8 hours."""
-    secret = os.getenv("ADMIN_JWT_SECRET")
-    if not secret:
-        print("ADMIN_JWT_SECRET is missing from environment variables", file=sys.stderr)
-        raise ValueError("ADMIN_JWT_SECRET is not set")
-    
-    now = datetime.now(timezone.utc)
-    expire = now + timedelta(hours=8)
-    payload = {
-        "sub": "admin",
-        "role": "admin",
-        "exp": int(expire.timestamp())
-    }
-    return jwt.encode(payload, secret, algorithm="HS256")
-
-def verify_admin_token(token: str) -> str:
-    """Verifies an Admin JWT token."""
-    secret = os.getenv("ADMIN_JWT_SECRET")
-    if not secret:
-        print("ADMIN_JWT_SECRET is missing from environment variables", file=sys.stderr)
-        raise ValueError("ADMIN_JWT_SECRET is not set")
-    
-    try:
-        payload = jwt.decode(token, secret, algorithms=["HS256"])
-        role = payload.get("role")
-        sub = payload.get("sub")
-        if role != "admin" or sub != "admin":
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid admin token claims"
-            )
-        return sub
-    except JWTError as e:
-        print(f"Admin JWT verification failed: {e}", file=sys.stderr)
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Could not validate credentials"
-        )
-
-# FastAPI Route dependencies
-
-async def get_current_user(
-    token: str = Depends(oauth2_scheme),
-    db: Client = Depends(get_db_connection)
-) -> dict:
-    """FastAPI Dependency: Authenticates a standard user and returns their database row."""
-    user_id = verify_user_token(token)
-    
-    try:
-        # Perform HTTP select using the Supabase client
-        res = db.table("users").select("id, email, display_name, avatar_seed, quiz_answers, status, room_id, created_at").eq("id", user_id).execute()
-        if not res.data:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="User not found"
-            )
-        return res.data[0]
-    except HTTPException:
-        raise
+        session = find_session(db, policy, token)
     except Exception as e:
-        print(f"Error fetching user profile in dependency (user_id={user_id}): {e}", file=sys.stderr)
+        print(f"Error loading {policy.role} session: {e}", file=sys.stderr)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Database error"
         )
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not logged in"
+        )
+    return session
 
-async def get_current_admin(
-    token: str = Depends(admin_oauth2_scheme)
-) -> str:
-    """FastAPI Dependency: Authenticates the admin."""
-    return verify_admin_token(token)
+# FastAPI Route dependencies
+
+async def get_user_session(
+    token: str | None = Depends(user_session_cookie),
+    db: Client = Depends(get_db_connection)
+) -> dict:
+    """FastAPI Dependency: the caller's live user session, with their users row under "users"."""
+    return _require_session(db, USER_SESSION, token)
+
+async def get_current_user(session: dict = Depends(get_user_session)) -> dict:
+    """FastAPI Dependency: Authenticates a standard user and returns their database row."""
+    return session["users"]
+
+async def get_admin_session(
+    token: str | None = Depends(admin_session_cookie),
+    db: Client = Depends(get_db_connection)
+) -> dict:
+    """FastAPI Dependency: the caller's live admin session."""
+    return _require_session(db, ADMIN_SESSION, token)
+
+async def get_current_admin(session: dict = Depends(get_admin_session)) -> str:
+    """FastAPI Dependency: Authenticates the admin and returns their username."""
+    return os.getenv("ADMIN_USERNAME", "admin")

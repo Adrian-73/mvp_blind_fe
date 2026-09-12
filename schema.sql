@@ -11,7 +11,7 @@ create table rooms (
 );
 
 -- Create users table referencing rooms
--- Profile columns (gender through single_reason) are collected at password signup; they stay
+-- Profile columns (date_of_birth through single_reason) are collected at password signup; they stay
 -- nullable because email-OTP auto-signups skip that form.
 create table users (
   id uuid primary key default gen_random_uuid(),
@@ -19,6 +19,7 @@ create table users (
   display_name text not null,
   avatar_seed text not null,
   quiz_answers jsonb not null default '{}',
+  date_of_birth date,
   gender text check (gender in ('male', 'female', 'non_binary')),
   interested_in text[] check (interested_in <@ array['male', 'female', 'non_binary']),
   state text,
@@ -58,11 +59,37 @@ create table email_otps (
   attempts integer not null default 0
 );
 
+-- Server-side login sessions for users and the admin. The browser holds a random token in an
+-- httpOnly cookie and only its SHA-256 hash is stored here, so a session ends the moment its row is deleted.
+-- Migration for existing databases created before sessions existed: run this block and the two statements after it.
+create table sessions (
+  id uuid primary key default gen_random_uuid(),
+  role text not null check (role in ('user', 'admin')),
+  user_id uuid references users(id) on delete cascade,
+  token_hash text not null unique,
+  -- Admin sessions only: fingerprint of ADMIN_USERNAME + ADMIN_PASSWORD_HASH, so changing either signs every admin out
+  admin_fingerprint text,
+  created_at timestamptz not null default now(),
+  last_seen_at timestamptz not null default now(),
+  -- Slides forward with activity, but never past the session's maximum lifetime
+  expires_at timestamptz not null,
+  check (
+    (role = 'user' and user_id is not null)
+    or (role = 'admin' and user_id is null and admin_fingerprint is not null)
+  )
+);
+
+create index idx_sessions_user on sessions(user_id);
+
+-- The backend's service_role key bypasses RLS; with no policies, the public anon key can't read session rows
+alter table sessions enable row level security;
+
 -- Migration for existing databases created before the "attempts" lockout counter existed:
 -- alter table email_otps add column if not exists attempts integer not null default 0;
 
 -- Migration for existing databases created before signup collected profile details
 -- (safe to re-run: columns that already exist are skipped):
+-- alter table users add column if not exists date_of_birth date;
 -- alter table users add column if not exists gender text check (gender in ('male', 'female', 'non_binary'));
 -- alter table users add column if not exists interested_in text[] check (interested_in <@ array['male', 'female', 'non_binary']);
 -- alter table users add column if not exists state text;

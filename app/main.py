@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 # Load local environment variables from .env file
 load_dotenv()
 
-from fastapi import FastAPI, Depends, HTTPException, status, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Depends, HTTPException, status, Query, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -18,13 +18,18 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 
 from app.database import init_db, close_db, get_db_connection
-from app.auth import get_current_user, get_current_admin, verify_user_token
+from app.auth import get_current_user, get_current_admin, get_user_session, verify_password
+from app.sessions import (
+    USER_SESSION, ADMIN_SESSION, TrustedOriginMiddleware, allowed_origins, is_trusted_origin,
+    start_session, find_session, end_session, end_all_user_sessions
+)
 from app.schemas import (
     SignupRequest, LoginRequest, AuthResponse,
     SendOtpRequest, VerifyOtpRequest,
     StatusResponse, MessagesListResponse, MessageResponse,
-    AdminLoginRequest, AdminTokenResponse, AdminUsersListResponse,
-    MatchRequest, MatchResponse, AdminRoomsListResponse, AdminEmailConfigResponse
+    AdminLoginRequest, AdminSessionResponse, AdminUsersListResponse,
+    MatchRequest, MatchResponse, AdminRoomsListResponse, AdminEmailConfigResponse,
+    age_from_date_of_birth
 )
 from app.services import (
     register_user, authenticate_user, get_user_status, submit_quiz,
@@ -49,7 +54,7 @@ tags_metadata = [
     },
     {
         "name": "User Authentication",
-        "description": "Standard user registration and login endpoints to obtain JWT session tokens.",
+        "description": "Registration, login and logout. Logging in sets an httpOnly session cookie that every user endpoint reads.",
     },
     {
         "name": "User Operations & Chat",
@@ -57,7 +62,7 @@ tags_metadata = [
     },
     {
         "name": "Admin Authentication",
-        "description": "Administrative credential verification and high-privilege access token generation.",
+        "description": "Admin login and logout, backed by a short-lived httpOnly session cookie.",
     },
     {
         "name": "Admin Control Panel",
@@ -79,11 +84,13 @@ app = FastAPI(
     redoc_url=None
 )
 
-# CORS Configuration
-frontend_url = os.getenv("FRONTEND_URL", "http://localhost:5173")
+# Blocks cross-site POSTs riding on the session cookies. Added before CORS so CORS stays outermost.
+app.add_middleware(TrustedOriginMiddleware)
+
+# CORS Configuration: credentials on, so the session cookie also works from the Vite dev server
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[frontend_url, "http://localhost:5173"],
+    allow_origins=allowed_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -583,7 +590,7 @@ SWAGGER_TEMPLATE = """
             <div class="sandbox-card card-purple">
                 <div>
                     <h3>🎭 Quick User Sandbox</h3>
-                    <p>Instantly generate and register a new random user profile, fetch their JWT, and auto-authorize Swagger UI for user endpoints.</p>
+                    <p>Instantly register a new random user and log in as them. Their session cookie rides along with every "Try it out" call below.</p>
                 </div>
                 <div class="sandbox-actions">
                     <button id="btn-user-auth" class="sandbox-btn btn-purple">
@@ -597,7 +604,7 @@ SWAGGER_TEMPLATE = """
             <div class="sandbox-card card-teal">
                 <div>
                     <h3>🔑 Quick Admin Sandbox</h3>
-                    <p>Log in using admin credentials to generate an admin token, and auto-authorize Swagger UI for admin endpoints.</p>
+                    <p>Log in with admin credentials. The admin session cookie authorizes the admin endpoints below.</p>
                 </div>
                 <div>
                     <div class="sandbox-inputs">
@@ -692,6 +699,7 @@ SWAGGER_TEMPLATE = """
                     body: JSON.stringify({
                         email: testEmail,
                         password: testPassword,
+                        date_of_birth: "1998-04-12",
                         gender: "female",
                         interested_in: ["male"],
                         state: "Karnataka",
@@ -711,18 +719,9 @@ SWAGGER_TEMPLATE = """
                     throw new Error(`Signup failed: ${signupRes.statusText}`);
                 }
                 
-                const signupData = await signupRes.json();
-                const token = signupData.token;
-                
-                // programmatically authorize user
-                if (window.ui) {
-                    window.ui.preauthorizeApiKey("UserSecurity", token);
-                    statusMsg.className = "status-msg success";
-                    statusMsg.innerText = `Authorized: ${testEmail}`;
-                } else {
-                    statusMsg.className = "status-msg error";
-                    statusMsg.innerText = "Swagger UI not ready";
-                }
+                // The response set the session cookie, which Swagger's same-origin requests send from here on
+                statusMsg.className = "status-msg success";
+                statusMsg.innerText = `Logged in: ${testEmail}`;
                 
             } catch (err) {
                 statusMsg.className = "status-msg error";
@@ -757,18 +756,9 @@ SWAGGER_TEMPLATE = """
                     throw new Error("Invalid admin credentials");
                 }
                 
-                const loginData = await loginRes.json();
-                const token = loginData.token;
-                
-                // programmatically authorize admin
-                if (window.ui) {
-                    window.ui.preauthorizeApiKey("AdminSecurity", token);
-                    statusMsg.className = "status-msg success";
-                    statusMsg.innerText = "Admin Authorized!";
-                } else {
-                    statusMsg.className = "status-msg error";
-                    statusMsg.innerText = "Swagger UI not ready";
-                }
+                // The response set the admin session cookie
+                statusMsg.className = "status-msg success";
+                statusMsg.innerText = "Admin logged in";
                 
             } catch (err) {
                 statusMsg.className = "status-msg error";
@@ -924,18 +914,26 @@ async def health_check():
 @app.post("/api/signup", response_model=AuthResponse, status_code=status.HTTP_200_OK, tags=["User Authentication"])
 async def signup(
     body: SignupRequest,
+    request: Request,
+    response: Response,
     db: Client = Depends(get_db_connection)
 ):
-    """Signs up a new user and returns their profile with custom JWT."""
-    return await register_user(body.email, body.password, body.quiz_answers, body.profile_fields(), db)
+    """Signs up a new user, logs them in with a session cookie and returns their profile."""
+    user = await register_user(body.email, body.password, body.quiz_answers, body.profile_fields(), db)
+    start_session(db, USER_SESSION, request, response, user_id=user["id"])
+    return {"user": user}
 
 @app.post("/api/auth/login", response_model=AuthResponse, status_code=status.HTTP_200_OK, tags=["User Authentication"])
 async def login(
     body: LoginRequest,
+    request: Request,
+    response: Response,
     db: Client = Depends(get_db_connection)
 ):
-    """Authenticates user credentials and returns user profile with JWT."""
-    return await authenticate_user(body.email, body.password, db)
+    """Verifies user credentials, starts a fresh session cookie and returns the user profile."""
+    user = await authenticate_user(body.email, body.password, db)
+    start_session(db, USER_SESSION, request, response, user_id=user["id"])
+    return {"user": user}
 
 @app.post("/api/auth/send-otp", status_code=status.HTTP_200_OK, tags=["User Authentication"])
 async def send_otp(
@@ -948,10 +946,40 @@ async def send_otp(
 @app.post("/api/auth/verify-otp", response_model=AuthResponse, status_code=status.HTTP_200_OK, tags=["User Authentication"])
 async def verify_otp(
     body: VerifyOtpRequest,
+    request: Request,
+    response: Response,
     db: Client = Depends(get_db_connection)
 ):
     """Verifies the provided OTP against the database and logs the user in (or auto-registers them)."""
-    return await verify_email_otp(body.email, body.otp_code, db)
+    user = await verify_email_otp(body.email, body.otp_code, db)
+    start_session(db, USER_SESSION, request, response, user_id=user["id"])
+    return {"user": user}
+
+@app.post("/api/auth/logout", status_code=status.HTTP_200_OK, tags=["User Authentication"])
+async def logout(
+    request: Request,
+    response: Response,
+    db: Client = Depends(get_db_connection)
+):
+    """Ends this browser's session and clears its cookie. Safe to call when already logged out."""
+    await end_session(db, USER_SESSION, request, response)
+    return {"status": "success"}
+
+@app.post("/api/auth/logout-all", status_code=status.HTTP_200_OK, tags=["User Authentication"])
+async def logout_everywhere(
+    request: Request,
+    response: Response,
+    session: dict = Depends(get_user_session),
+    db: Client = Depends(get_db_connection)
+):
+    """Ends every session the user has, on all devices, this one included."""
+    await end_all_user_sessions(db, session["user_id"], request, response)
+    return {"status": "success"}
+
+@app.get("/api/auth/session", response_model=AuthResponse, status_code=status.HTTP_200_OK, tags=["User Authentication"])
+async def get_session(current_user: dict = Depends(get_current_user)):
+    """Returns the logged-in user, or 401 without a live session. The frontend checks this before showing user pages."""
+    return {"user": current_user}
 
 # --- User Routes ---
 
@@ -998,9 +1026,14 @@ async def get_messages(
 
 # --- Admin Auth Endpoints ---
 
-@app.post("/api/admin/login", response_model=AdminTokenResponse, status_code=status.HTTP_200_OK, tags=["Admin Authentication"])
-async def admin_login(body: AdminLoginRequest):
-    """Authenticates the admin using environment variables and generates an Admin JWT."""
+@app.post("/api/admin/login", response_model=AdminSessionResponse, status_code=status.HTTP_200_OK, tags=["Admin Authentication"])
+async def admin_login(
+    body: AdminLoginRequest,
+    request: Request,
+    response: Response,
+    db: Client = Depends(get_db_connection)
+):
+    """Authenticates the admin against environment variables and starts an admin session cookie."""
     admin_user = os.getenv("ADMIN_USERNAME")
     admin_pwd_hash = os.getenv("ADMIN_PASSWORD_HASH")
     
@@ -1011,7 +1044,6 @@ async def admin_login(body: AdminLoginRequest):
             detail="Admin environment setup incomplete"
         )
         
-    from app.auth import verify_password, create_admin_token
     import hmac
 
     if not hmac.compare_digest(body.username, admin_user) or not verify_password(body.password, admin_pwd_hash):
@@ -1020,8 +1052,23 @@ async def admin_login(body: AdminLoginRequest):
             detail="Invalid admin credentials"
         )
         
-    token = create_admin_token()
-    return {"token": token}
+    start_session(db, ADMIN_SESSION, request, response)
+    return {"username": admin_user}
+
+@app.post("/api/admin/logout", status_code=status.HTTP_200_OK, tags=["Admin Authentication"])
+async def admin_logout(
+    request: Request,
+    response: Response,
+    db: Client = Depends(get_db_connection)
+):
+    """Ends this browser's admin session and clears its cookie. Safe to call when already logged out."""
+    await end_session(db, ADMIN_SESSION, request, response)
+    return {"status": "success"}
+
+@app.get("/api/admin/session", response_model=AdminSessionResponse, status_code=status.HTTP_200_OK, tags=["Admin Authentication"])
+async def get_admin_session_info(current_admin: str = Depends(get_current_admin)):
+    """Returns the admin username, or 401 without a live admin session."""
+    return {"username": current_admin}
 
 # --- Admin Operations Endpoints ---
 
@@ -1099,7 +1146,7 @@ async def export_users_csv_stream():
     writer = csv.writer(output)
     
     # Header
-    writer.writerow(["id", "email", "display_name", "status", "created_at", "gender", "interested_in", "state", "bio", "single_reason", "quiz_answers"])
+    writer.writerow(["id", "email", "display_name", "status", "created_at", "date_of_birth", "age", "gender", "interested_in", "state", "bio", "single_reason", "quiz_answers"])
     yield output.getvalue()
     output.seek(0)
     output.truncate(0)
@@ -1108,7 +1155,7 @@ async def export_users_csv_stream():
     offset = 0
     while True:
         try:
-            res = db.table("users").select("id, email, display_name, status, created_at, quiz_answers, gender, interested_in, state, bio, single_reason")\
+            res = db.table("users").select("id, email, display_name, status, created_at, quiz_answers, date_of_birth, gender, interested_in, state, bio, single_reason")\
                 .order("created_at", desc=True)\
                 .range(offset, offset + chunk_size - 1).execute()
         except Exception as e:
@@ -1138,6 +1185,8 @@ async def export_users_csv_stream():
                 _sanitize_csv_field(row["display_name"]),
                 row["status"],
                 created_at_str,
+                _sanitize_csv_field(row["date_of_birth"]),
+                _sanitize_csv_field(age_from_date_of_birth(row["date_of_birth"])),
                 _sanitize_csv_field(row["gender"]),
                 _sanitize_csv_field(", ".join(row["interested_in"] or [])),
                 _sanitize_csv_field(row["state"]),
@@ -1250,31 +1299,43 @@ async def export_messages_csv(
 @app.websocket("/ws/{room_id}")
 async def websocket_room_handler(websocket: WebSocket, room_id: UUID):
     """Establishes real-time duplex chat session inside active matchmaking rooms."""
-    token = websocket.query_params.get("token")
-    if not token:
-        # Invalid handshake: token missing
-        await websocket.close(code=4001, reason="Token query param missing")
+
+    async def reject(code: int, reason: str) -> None:
+        # Accept first: a close before accept reaches the browser as a failed handshake (code 1006),
+        # hiding the 4001/4003 codes the client relies on to stop reconnecting
+        await websocket.accept()
+        await websocket.close(code=code, reason=reason)
+
+    # Backs up SameSite=Lax: refuse handshakes started by pages on other sites
+    if not is_trusted_origin(websocket.headers):
+        await reject(4003, "Cross-site connection blocked")
         return
-        
-    try:
-        user_id_str = verify_user_token(token)
-        user_id = UUID(user_id_str)
-    except Exception:
-        await websocket.close(code=4001, reason="Invalid token")
-        return
-        
-    # Verify room is active and user is a participant
+
     from app.database import get_db_client
     try:
         db = get_db_client()
     except Exception:
         await websocket.close(code=1011, reason="Database client uninitialized")
         return
-        
+
+    # The browser sends the session cookie with the handshake, so no token ever lands in the URL (or access logs)
+    session_token = websocket.cookies.get(USER_SESSION.cookie_name)
+    try:
+        session = find_session(db, USER_SESSION, session_token)
+    except Exception as e:
+        print(f"Error loading session in WS for room {room_id}: {e}", file=sys.stderr)
+        await websocket.close(code=1011, reason="Database read error")
+        return
+    if not session:
+        await reject(4001, "Not logged in")
+        return
+    user_id = UUID(session["user_id"])
+
+    # Verify room is active and user is a participant
     try:
         res_room = db.table("rooms").select("user_a, user_b, is_active").eq("id", str(room_id)).execute()
         if not res_room.data:
-            await websocket.close(code=4003, reason="Active room not found")
+            await reject(4003, "Active room not found")
             return
         room_row = res_room.data[0]
     except Exception as e:
@@ -1283,11 +1344,11 @@ async def websocket_room_handler(websocket: WebSocket, room_id: UUID):
         return
             
     if not room_row or not room_row["is_active"]:
-        await websocket.close(code=4003, reason="Active room not found")
+        await reject(4003, "Active room not found")
         return
-        
+
     if room_row["user_a"] != str(user_id) and room_row["user_b"] != str(user_id):
-        await websocket.close(code=4003, reason="Access to room forbidden")
+        await reject(4003, "Access to room forbidden")
         return
 
     # Add connection to registry
@@ -1296,7 +1357,14 @@ async def websocket_room_handler(websocket: WebSocket, room_id: UUID):
     
     # Accept handshake
     await websocket.accept()
+    # Lets a logout find and close the sockets its session opened
+    websocket.state.session_id = str(session["id"])
     connections[room_key][user_key] = websocket
+
+    # Logouts close their sockets directly, but only in this process; re-checking now and then also
+    # catches expiry and logouts handled by another worker
+    SESSION_RECHECK_SECONDS = 60
+    session_checked_at = time.monotonic()
 
     # Simple sliding-window rate limit to stop a single connection from spamming
     # unlimited messages/DB writes: at most 10 messages per rolling 5-second window.
@@ -1308,6 +1376,18 @@ async def websocket_room_handler(websocket: WebSocket, room_id: UUID):
         while True:
             # Await messaging loop
             text_data = await websocket.receive_text()
+
+            if time.monotonic() - session_checked_at >= SESSION_RECHECK_SECONDS:
+                session_checked_at = time.monotonic()
+                try:
+                    session_alive = find_session(db, USER_SESSION, session_token) is not None
+                except Exception as e:
+                    # Don't cut a conversation off over a transient database error
+                    print(f"Error re-checking session in WS for user_id={user_id}: {e}", file=sys.stderr)
+                    session_alive = True
+                if not session_alive:
+                    await websocket.close(code=4001, reason="Session ended")
+                    break
 
             now = time.monotonic()
             message_timestamps[:] = [t for t in message_timestamps if now - t < RATE_LIMIT_WINDOW_SECONDS]

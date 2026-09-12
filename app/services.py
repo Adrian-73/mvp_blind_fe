@@ -8,7 +8,7 @@ from fastapi import HTTPException, status
 from supabase import Client
 from app.utils.names import generate_display_name
 from app.utils.avatars import generate_avatar_seed
-from app.auth import hash_password, verify_password, create_user_token
+from app.auth import hash_password, verify_password
 from app.state import connections
 from app.mailer import send_match_emails
 
@@ -21,7 +21,7 @@ async def register_user(
 ) -> dict:
     """Signs up a new user, hashes their password, generates display names/avatars,
     
-    creates records inside Supabase over HTTP, and issues a JWT token.
+    creates records inside Supabase over HTTP, and returns the new user's public profile.
     """
     # 1. Check if email already registered
     try:
@@ -84,16 +84,11 @@ async def register_user(
             "password_hash": hashed_pwd
         }).execute()
         
-        token = create_user_token(str(user_id))
-        
         return {
-            "token": token,
-            "user": {
-                "id": user_id,
-                "display_name": user_row["display_name"],
-                "avatar_seed": user_row["avatar_seed"],
-                "status": user_row["status"]
-            }
+            "id": user_id,
+            "display_name": user_row["display_name"],
+            "avatar_seed": user_row["avatar_seed"],
+            "status": user_row["status"]
         }
     except Exception as e:
         print(f"Signup failed for {email}: {e}", file=sys.stderr)
@@ -113,7 +108,7 @@ async def authenticate_user(
     password_plain: str,
     db: Client
 ) -> dict:
-    """Verifies user login credentials, fetches user profile, and issues a JWT."""
+    """Verifies user login credentials and returns the user's public profile."""
     try:
         # Fetch profile and password hash using PostgREST relation selection
         res = db.table("users").select(
@@ -141,16 +136,11 @@ async def authenticate_user(
                 detail="Invalid email or password"
             )
             
-        token = create_user_token(str(row["id"]))
-        
         return {
-            "token": token,
-            "user": {
-                "id": row["id"],
-                "display_name": row["display_name"],
-                "avatar_seed": row["avatar_seed"],
-                "status": row["status"]
-            }
+            "id": row["id"],
+            "display_name": row["display_name"],
+            "avatar_seed": row["avatar_seed"],
+            "status": row["status"]
         }
     except HTTPException:
         raise
@@ -319,7 +309,7 @@ async def get_admin_users(
     offset = (page - 1) * limit
 
     try:
-        query = db.table("users").select("id, email, display_name, avatar_seed, status, room_id, quiz_answers, gender, interested_in, state, bio, single_reason, created_at", count="exact")
+        query = db.table("users").select("id, email, display_name, avatar_seed, status, room_id, quiz_answers, date_of_birth, gender, interested_in, state, bio, single_reason, created_at", count="exact")
 
         if search:
             pattern = _escape_postgrest_value(f"%{search}%")
@@ -637,15 +627,11 @@ async def verify_email_otp(email: str, otp_code: str, db: Client) -> dict:
         if user_res.data:
             # User exists, proceed with login
             user_row = user_res.data[0]
-            token = create_user_token(str(user_row["id"]))
             return {
-                "token": token,
-                "user": {
-                    "id": user_row["id"],
-                    "display_name": user_row["display_name"],
-                    "avatar_seed": user_row["avatar_seed"],
-                    "status": user_row["status"]
-                }
+                "id": user_row["id"],
+                "display_name": user_row["display_name"],
+                "avatar_seed": user_row["avatar_seed"],
+                "status": user_row["status"]
             }
         else:
             # Auto-signup
@@ -672,15 +658,11 @@ async def verify_email_otp(email: str, otp_code: str, db: Client) -> dict:
                 raise Exception("Failed to insert user profile row")
                 
             new_user = insert_res.data[0]
-            token = create_user_token(str(new_user["id"]))
             return {
-                "token": token,
-                "user": {
-                    "id": new_user["id"],
-                    "display_name": new_user["display_name"],
-                    "avatar_seed": new_user["avatar_seed"],
-                    "status": new_user["status"]
-                }
+                "id": new_user["id"],
+                "display_name": new_user["display_name"],
+                "avatar_seed": new_user["avatar_seed"],
+                "status": new_user["status"]
             }
             
     except HTTPException:
