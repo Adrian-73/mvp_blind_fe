@@ -152,6 +152,7 @@ To deploy onto **Render free tier** using the blueprint `render.yaml` configurat
 - **GET** `/api/auth/session`: Returns the logged-in user, or 401 without a live session.
 - **POST** `/api/auth/logout`: Ends this browser's session.
 - **POST** `/api/auth/logout-all`: Ends all of the user's sessions, on every device.
+- **DELETE** `/api/me`: Deletes the account for good, with every chat room the user was in and its messages. A partner in an active chat goes back to waiting, and every session ends.
 - **GET** `/api/me/status`: Returns matchmaking status and active room partner information (Polled every 4s).
 - **POST** `/api/user/quiz`: Submit or update quiz answers.
 - **GET** `/api/rooms/{room_id}/messages`: Paginated message history (last 50 messages, ordered ascending).
@@ -165,6 +166,7 @@ To deploy onto **Render free tier** using the blueprint `render.yaml` configurat
 - **GET** `/api/admin/email-config`: Returns `{"enabled": true}` when SMTP is configured, so the admin panel knows whether match emails can be sent.
 - **GET** `/api/admin/rooms`: Lists all active rooms.
 - **POST** `/api/admin/rooms/{room_id}/deactivate`: Closes room, releases users, and cleans up sockets.
+- **DELETE** `/api/admin/users/{user_id}`: Deletes a user the same way `DELETE /api/me` does.
 - **GET** `/api/admin/users/export`: High-performance Streaming CSV export of all users.
 - **GET** `/api/admin/messages/export`: High-performance Streaming CSV export of messaging history.
 

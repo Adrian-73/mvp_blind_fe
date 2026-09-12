@@ -563,6 +563,59 @@ async def deactivate_room(
             detail="Database error during deactivation"
         )
 
+async def delete_user(
+    user_id: UUID | str,
+    db: Client
+) -> dict:
+    """Deletes a user for good, along with every room they were in and those rooms' messages.
+
+    A partner in their active room goes back to waiting, as with an unmatch. Their password and
+    sessions go with the users row, which logs them out on every device. Raises 404 for unknown users.
+    """
+    user_key = str(user_id)
+    try:
+        res_user = db.table("users").select("email, room_id").eq("id", user_key).execute()
+        if not res_user.data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User not found"
+            )
+        user_row = res_user.data[0]
+
+        if user_row["room_id"]:
+            try:
+                # Ends the chat on the partner's screen too and sends them back to waiting
+                await deactivate_room(UUID(user_row["room_id"]), db, reason="Match deleted their account")
+            except HTTPException as e:
+                # The room was already closed
+                if e.status_code != status.HTTP_404_NOT_FOUND:
+                    raise
+
+        # PostgREST has no transactions, so the steps run in an order where stopping partway leaves
+        # the user unmatched, and deleting again finishes the job
+        res_rooms = db.table("rooms").select("id").or_(f"user_a.eq.{user_key},user_b.eq.{user_key}").execute()
+        room_ids = [row["id"] for row in (res_rooms.data or [])]
+        if room_ids:
+            # Nobody stays "matched" into a room that's about to disappear
+            db.table("users").update({"status": "waiting", "room_id": None}).in_("room_id", room_ids).execute()
+            # Messages cascade with their rooms
+            db.table("rooms").delete().in_("id", room_ids).execute()
+
+        # Credentials and sessions cascade with the users row
+        db.table("users").delete().eq("id", user_key).execute()
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error deleting user_id={user_key}: {e}", file=sys.stderr)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Couldn't delete the account"
+        )
+
+    # A sign-in code still pending for this address
+    delete_email_otp(user_row["email"], db)
+    return {"status": "success"}
+
 OTP_TTL = timedelta(minutes=10)
 # How long an address waits before it can be sent another code, so nobody can flood an inbox or burn the SMTP quota
 OTP_RESEND_COOLDOWN = timedelta(seconds=60)

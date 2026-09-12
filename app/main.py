@@ -21,7 +21,7 @@ from app.database import init_db, close_db, get_db_connection
 from app.auth import get_current_user, get_current_admin, get_user_session, verify_password
 from app.sessions import (
     USER_SESSION, ADMIN_SESSION, TrustedOriginMiddleware, allowed_origins, is_trusted_origin,
-    start_session, find_session, end_session, end_all_user_sessions
+    start_session, find_session, end_session, end_all_user_sessions, clear_session_cookie
 )
 from app.schemas import (
     SignupRequest, LoginRequest, AuthResponse,
@@ -33,7 +33,7 @@ from app.schemas import (
 )
 from app.services import (
     register_user, authenticate_user, get_user_status, submit_quiz,
-    get_room_messages, get_admin_users, match_users, get_admin_rooms, deactivate_room,
+    get_room_messages, get_admin_users, match_users, get_admin_rooms, deactivate_room, delete_user,
     send_email_otp, check_email_otp, delete_email_otp, verify_email_otp
 )
 from app.state import connections
@@ -1007,6 +1007,18 @@ async def unmatch_from_room(
     room_id = res.data[0]["room_id"]
     return await deactivate_room(UUID(room_id), db, reason="User left the chat")
 
+@app.delete("/api/me", status_code=status.HTTP_200_OK, tags=["User Operations & Chat"])
+async def delete_my_account(
+    request: Request,
+    response: Response,
+    current_user: dict = Depends(get_current_user),
+    db: Client = Depends(get_db_connection)
+):
+    """Deletes the logged-in user's account for good, ends their chat and logs them out on every device."""
+    await delete_user(current_user["id"], db)
+    clear_session_cookie(request, response, USER_SESSION)
+    return {"status": "success"}
+
 @app.post("/api/user/quiz", status_code=status.HTTP_200_OK, tags=["User Operations & Chat"])
 async def submit_user_quiz(
     body: dict[str, str],
@@ -1120,6 +1132,15 @@ async def deactivate_chat_room(
 ):
     """Closes an active chat room and resets the status of both users back to waiting (admin only)."""
     return await deactivate_room(room_id, db)
+
+@app.delete("/api/admin/users/{user_id}", status_code=status.HTTP_200_OK, tags=["Admin Control Panel"])
+async def delete_user_account(
+    user_id: UUID,
+    current_admin: str = Depends(get_current_admin),
+    db: Client = Depends(get_db_connection)
+):
+    """Deletes a user for good, with every chat they were in. A partner in an active chat goes back to waiting (admin only)."""
+    return await delete_user(user_id, db)
 
 # --- Admin CSV Export Endpoints (Streamed Response) ---
 

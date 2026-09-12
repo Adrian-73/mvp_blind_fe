@@ -506,6 +506,52 @@ class TestSessions(ApiTestCase):
         self.assertTrue(self.mock_db.ran("sessions", ("delete", ()), ("eq", ("user_id", USER_ROW["id"]))))
         self.assertIn("Max-Age=0", self.set_cookie_header(response, USER_SESSION.cookie_name))
 
+    def test_user_can_delete_their_account(self):
+        """Verify deleting your own account removes the users row and any pending sign-in code, and clears the cookie."""
+        self.log_in_as_user()
+        self.mock_db_responses["users"] = MockAPIResponse([{"email": USER_ROW["email"], "room_id": None}])
+
+        response = self.client.delete("/api/me")
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(self.mock_db.ran("users", ("delete", ()), ("eq", ("id", USER_ROW["id"]))))
+        self.assertTrue(self.mock_db.ran("email_otps", ("delete", ()), ("eq", ("email", USER_ROW["email"]))))
+        self.assertIn("Max-Age=0", self.set_cookie_header(response, USER_SESSION.cookie_name))
+
+    def test_deleting_a_matched_user_ends_the_chat_and_frees_their_partner(self):
+        """Verify deleting a matched user closes their room, sends the partner back to waiting and removes every room they were in."""
+        room_id = str(uuid4())
+        partner_id = str(uuid4())
+        partner_socket = SimpleNamespace(send_text=AsyncMock(), close=AsyncMock())
+        connections[room_id] = {partner_id: partner_socket}
+        self.addCleanup(connections.pop, room_id, None)
+        self.mock_db_responses["users"] = MockAPIResponse([{"email": USER_ROW["email"], "room_id": room_id}])
+        self.mock_db_responses["rooms"] = MockAPIResponse([{"id": room_id, "user_a": USER_ROW["id"], "user_b": partner_id, "is_active": True}])
+        self.log_in_as_admin()
+
+        response = self.client.delete(f"/api/admin/users/{USER_ROW['id']}")
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(self.mock_db.ran("rooms", ("update", ({"is_active": False},))))
+        self.assertTrue(self.mock_db.ran(
+            "users", ("update", ({"room_id": None, "status": "waiting"},)), ("in_", ("id", [USER_ROW["id"], partner_id]))
+        ))
+        partner_socket.close.assert_awaited_once_with(code=4003, reason="Match deleted their account")
+        self.assertTrue(self.mock_db.ran("rooms", ("delete", ()), ("in_", ("id", [room_id]))))
+        self.assertTrue(self.mock_db.ran("users", ("delete", ()), ("eq", ("id", USER_ROW["id"]))))
+
+    def test_admin_delete_of_unknown_user_is_404(self):
+        """Verify deleting a user who doesn't exist changes nothing."""
+        self.log_in_as_admin()
+        response = self.client.delete(f"/api/admin/users/{uuid4()}")
+        self.assertEqual(response.status_code, 404)
+        self.assertFalse(self.mock_db.ran("users", ("delete", ())))
+
+    def test_users_cannot_delete_other_users(self):
+        """Verify the admin delete endpoint refuses user sessions."""
+        self.log_in_as_user()
+        response = self.client.delete(f"/api/admin/users/{uuid4()}")
+        self.assertEqual(response.status_code, 401)
+        self.assertFalse(self.mock_db.ran("users", ("delete", ())))
+
     def test_admin_logout(self):
         """Verify admin logout deletes the admin session and clears its cookie."""
         self.log_in_as_admin()
